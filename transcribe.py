@@ -25,6 +25,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # tiny, base, small, medium
 DEVICE = os.getenv("DEVICE", "cpu")  # cpu or cuda
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")  # int8, float16, float32
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
+AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SAMPLE_RATE = 16000
 
@@ -118,6 +119,23 @@ def copy_to_clipboard(text: str) -> None:
             stderr=subprocess.DEVNULL
         )
         print("📋 Copied to clipboard", file=sys.stderr)
+
+        # Auto-paste if enabled
+        if AUTO_PASTE:
+            import time
+            time.sleep(0.1)  # Brief delay to ensure clipboard is populated
+            try:
+                subprocess.run(
+                    ['xdotool', 'key', 'ctrl+v'],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                print("✅ Auto-pasted", file=sys.stderr)
+            except subprocess.CalledProcessError:
+                print("⚠️  Failed to auto-paste (xdotool error)", file=sys.stderr)
+            except FileNotFoundError:
+                print("⚠️  xdotool not found. Install with: sudo apt install xdotool", file=sys.stderr)
     except subprocess.CalledProcessError:
         print("⚠️  Failed to copy to clipboard (xclip not installed?)", file=sys.stderr)
     except FileNotFoundError:

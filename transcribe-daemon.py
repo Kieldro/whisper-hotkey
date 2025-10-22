@@ -27,6 +27,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 DEVICE = os.getenv("DEVICE", "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
+AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
@@ -163,7 +164,18 @@ class TranscriptionPipeline:
             stderr=subprocess.DEVNULL
         )
 
-        self._notify(f"✅ Copied: {final_text[:50]}...")
+        # Auto-paste if enabled
+        if AUTO_PASTE:
+            time.sleep(0.1)  # Brief delay to ensure clipboard is populated
+            subprocess.run(
+                ['xdotool', 'key', 'ctrl+v'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            self._notify(f"✅ Pasted: {final_text[:50]}...")
+        else:
+            self._notify(f"✅ Copied: {final_text[:50]}...")
+
         return final_text
 
     def _notify(self, message: str) -> None:

@@ -24,11 +24,11 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 
 - **Local transcription**: Uses faster-whisper (Whisper small model, ~500MB)
 - **Optional cloud polishing**: GPT-4o mini corrects grammar and formatting (disabled by default)
+- **Auto-paste**: Automatically pastes transcription into active window (enabled by default)
 - **Works offline**: Local-only mode requires no internet or API keys
 - **Two usage modes**: Simple (terminal-based) or Daemon (push-to-talk)
 - **Hotkey trigger**: Integrates with i3/sway/KDE/GNOME
 - **Desktop notifications**: Visual feedback during processing (daemon mode)
-- **Clipboard output**: Automatically copies result
 - **Low latency**: ~2s local-only, ~3-5s with polishing
 
 ## Usage Modes
@@ -60,6 +60,7 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 - Python 3.8+
 - PulseAudio or PipeWire (for audio recording)
 - xclip (for clipboard support)
+- xdotool (for auto-paste)
 
 **Optional (for polishing):**
 - OpenAI API key (get one at https://platform.openai.com/api-keys)
@@ -70,13 +71,13 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 
 ```bash
 # Debian/Ubuntu
-sudo apt install python3-venv python3-pip portaudio19-dev xclip libnotify-bin
+sudo apt install python3-venv python3-pip portaudio19-dev xclip xdotool libnotify-bin
 
 # Arch Linux
-sudo pacman -S python python-pip portaudio xclip libnotify
+sudo pacman -S python python-pip portaudio xclip xdotool libnotify
 
 # Fedora
-sudo dnf install python3-virtualenv portaudio-devel xclip libnotify
+sudo dnf install python3-virtualenv portaudio-devel xclip xdotool libnotify
 ```
 
 ### 2. Clone and Setup
@@ -151,15 +152,16 @@ For **KDE/GNOME**, configure custom shortcut with command:
 ```
 
 **Usage:**
-1. Press hotkey once → Recording starts (notification appears)
-2. Speak into microphone
-3. Press hotkey again → Recording stops, transcription begins
-4. Wait for notifications:
-   - **Local-only**: Transcribing → Copied
-   - **With polishing**: Transcribing → Polishing → Copied
-5. Result automatically in clipboard
+1. Click in text field where you want transcription to appear
+2. Press hotkey once → Recording starts (notification appears)
+3. Speak into microphone
+4. Press hotkey again → Recording stops, transcription begins
+5. Wait for notifications:
+   - **Local-only**: Transcribing → Pasted
+   - **With polishing**: Transcribing → Polishing → Pasted
+6. Transcription automatically appears in your text field!
 
-**No terminal window required!**
+**No terminal window, no manual pasting required!**
 
 ## Configuration
 
@@ -168,6 +170,7 @@ Edit `.env` to customize:
 | Variable | Default | Options | Notes |
 |----------|---------|---------|-------|
 | `ENABLE_POLISHING` | `false` | `true`, `false` | Enable GPT polishing (requires API key) |
+| `AUTO_PASTE` | `true` | `true`, `false` | Automatically paste transcription (requires xdotool) |
 | `OPENAI_API_KEY` | - | Your API key | Only needed if polishing enabled |
 | `WHISPER_MODEL` | `small` | `tiny`, `base`, `small`, `medium`, `large-v3` | Affects accuracy and speed |
 | `DEVICE` | `cpu` | `cpu`, `cuda` | Use `cuda` for GPU acceleration |
