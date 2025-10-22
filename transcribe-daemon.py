@@ -49,6 +49,9 @@ CHUNK_SIZE = 1024
 class AudioRecorderDaemon:
     """Non-blocking audio recorder using parecord."""
 
+    # Shared notification ID for replacing notifications
+    NOTIFICATION_ID = 999999
+
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
         self.is_recording = False
@@ -111,9 +114,9 @@ class AudioRecorderDaemon:
         return self.output_file
 
     def _notify(self, message: str) -> None:
-        """Send desktop notification."""
+        """Send desktop notification that replaces previous ones."""
         subprocess.run(
-            ['notify-send', '-t', '2000', 'Voice Transcription', message],
+            ['notify-send', '-t', '2000', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -126,6 +129,9 @@ class AudioRecorderDaemon:
 
 class TranscriptionPipeline:
     """Handles transcription and polishing pipeline."""
+
+    # Shared notification ID for replacing notifications
+    NOTIFICATION_ID = 999999
 
     def __init__(self):
         logger.info(f"Initializing TranscriptionPipeline (model={WHISPER_MODEL}, device={DEVICE}, polishing={ENABLE_POLISHING})")
@@ -224,9 +230,9 @@ class TranscriptionPipeline:
         return final_text
 
     def _notify(self, message: str) -> None:
-        """Send desktop notification."""
+        """Send desktop notification that replaces previous ones."""
         subprocess.run(
-            ['notify-send', '-t', '3000', 'Voice Transcription', message],
+            ['notify-send', '-t', '3000', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
