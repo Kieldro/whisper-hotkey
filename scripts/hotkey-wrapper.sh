@@ -14,9 +14,13 @@ echo "PROJECT_DIR: $PROJECT_DIR" >> "$LOG_FILE"
 echo "VENV_PYTHON: $VENV_PYTHON" >> "$LOG_FILE"
 echo "DAEMON_SCRIPT: $DAEMON_SCRIPT" >> "$LOG_FILE"
 
-# Run daemon in toggle mode
+# Run daemon in toggle mode (don't background - runs in foreground or sends signal)
 "$VENV_PYTHON" "$DAEMON_SCRIPT" >> "$LOG_FILE" 2>&1 &
+DAEMON_PID=$!
 
-echo "Daemon started with PID: $!" >> "$LOG_FILE"
+echo "Daemon started/signaled with PID: $DAEMON_PID" >> "$LOG_FILE"
+
+# Detach from parent process so GNOME doesn't kill it
+disown
 
 exit 0

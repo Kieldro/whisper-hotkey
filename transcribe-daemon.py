@@ -9,6 +9,7 @@ import sys
 import tempfile
 import subprocess
 import threading
+import signal
 from pathlib import Path
 from typing import Optional
 
@@ -224,29 +225,59 @@ def main():
         print("❌ Error: OPENAI_API_KEY not set (required when ENABLE_POLISHING=true)", file=sys.stderr)
         sys.exit(1)
 
+    state_file = "/tmp/whisper-hotkey-state"
+    pid_file = "/tmp/whisper-hotkey-pid"
+
+    if os.path.exists(state_file):
+        # Already recording, send signal to stop
+        try:
+            with open(pid_file, 'r') as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGUSR1)  # Signal to stop recording
+            os.unlink(state_file)
+            os.unlink(pid_file)
+        except (FileNotFoundError, ProcessLookupError, ValueError):
+            # Process already dead, clean up
+            if os.path.exists(state_file):
+                os.unlink(state_file)
+            if os.path.exists(pid_file):
+                os.unlink(pid_file)
+        sys.exit(0)
+
+    # Start new recording session
     daemon = TranscriptionDaemon()
 
+    # Write our PID
+    with open(pid_file, 'w') as f:
+        f.write(str(os.getpid()))
+
+    Path(state_file).touch()
+
+    # Set up signal handler to stop recording
+    stop_requested = threading.Event()
+
+    def handle_stop(signum, frame):
+        stop_requested.set()
+
+    signal.signal(signal.SIGUSR1, handle_stop)
+
     try:
-        # Toggle mode: start recording, wait for second invocation to stop
-        state_file = "/tmp/whisper-hotkey-state"
+        daemon.start_recording()
 
-        if os.path.exists(state_file):
-            # Already recording, stop and process
-            daemon.stop_and_process()
-            os.unlink(state_file)
-        else:
-            # Start recording
-            daemon.start_recording()
-            Path(state_file).touch()
+        # Wait for stop signal
+        stop_requested.wait()
 
-            # Keep process alive for recording
-            while daemon.recorder.is_recording:
-                time.sleep(0.1)
+        # Process the recording
+        daemon.stop_and_process()
 
     except KeyboardInterrupt:
         pass
     finally:
         daemon.cleanup()
+        if os.path.exists(state_file):
+            os.unlink(state_file)
+        if os.path.exists(pid_file):
+            os.unlink(pid_file)
 
 
 if __name__ == "__main__":
