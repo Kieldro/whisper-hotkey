@@ -15,8 +15,6 @@ from typing import Optional
 from faster_whisper import WhisperModel
 from openai import OpenAI
 from dotenv import load_dotenv
-import pyaudio
-import wave
 import time
 
 # Load environment variables
@@ -34,71 +32,53 @@ CHUNK_SIZE = 1024
 
 
 class AudioRecorderDaemon:
-    """Non-blocking audio recorder for daemon mode."""
+    """Non-blocking audio recorder using parecord."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
-        self.chunk_size = CHUNK_SIZE
         self.is_recording = False
-        self.frames = []
-        self.audio = pyaudio.PyAudio()
-        self.stream: Optional[pyaudio.Stream] = None
+        self.process: Optional[subprocess.Popen] = None
+        self.output_file: Optional[str] = None
 
     def start_recording(self) -> None:
-        """Start recording in background thread."""
+        """Start recording with parecord."""
         if self.is_recording:
             return
 
-        self.is_recording = True
-        self.frames = []
+        # Create temp file
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        self.output_file = temp_file.name
+        temp_file.close()
 
-        self.stream = self.audio.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=self.sample_rate,
-            input=True,
-            frames_per_buffer=self.chunk_size,
-            stream_callback=self._audio_callback
+        # Start parecord
+        self.process = subprocess.Popen(
+            [
+                'parecord',
+                '--format=s16le',
+                f'--rate={self.sample_rate}',
+                '--channels=1',
+                self.output_file
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
 
-        self.stream.start_stream()
+        self.is_recording = True
         self._notify("🎤 Recording...")
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        """Callback for audio stream."""
-        if self.is_recording:
-            self.frames.append(in_data)
-            return (in_data, pyaudio.paContinue)
-        return (in_data, pyaudio.paComplete)
-
     def stop_recording(self) -> Optional[str]:
-        """Stop recording and save to temporary file."""
+        """Stop recording and return file path."""
         if not self.is_recording:
             return None
 
         self.is_recording = False
 
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-
-        if not self.frames:
-            self._notify("⚠️  No audio recorded")
-            return None
-
-        # Save to temp file
-        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-        wav_path = temp_file.name
-        temp_file.close()
-
-        with wave.open(wav_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(self.audio.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(self.sample_rate)
-            wf.writeframes(b''.join(self.frames))
+        if self.process:
+            self.process.terminate()
+            self.process.wait(timeout=2)
 
         self._notify("⏹️  Recording stopped")
-        return wav_path
+        return self.output_file
 
     def _notify(self, message: str) -> None:
         """Send desktop notification."""
@@ -110,9 +90,8 @@ class AudioRecorderDaemon:
 
     def cleanup(self) -> None:
         """Cleanup audio resources."""
-        if self.stream:
-            self.stream.close()
-        self.audio.terminate()
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
 
 
 class TranscriptionPipeline:
