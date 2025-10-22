@@ -209,14 +209,14 @@ class TranscriptionPipeline:
 
         # Auto-paste if enabled
         if AUTO_PASTE:
-            logger.info("Auto-pasting...")
-            time.sleep(0.1)  # Brief delay to ensure clipboard is populated
+            logger.info("Auto-pasting with xdotool type...")
+            time.sleep(0.2)  # Brief delay
             result = subprocess.run(
-                ['xdotool', 'key', 'ctrl+v'],
+                ['xdotool', 'type', '--clearmodifiers', final_text],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            logger.info(f"xdotool exit code: {result.returncode}")
+            logger.info(f"xdotool type exit code: {result.returncode}")
             self._notify(f"✅ Pasted: {final_text[:50]}...")
         else:
             logger.info("Auto-paste disabled")

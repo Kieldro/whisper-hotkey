@@ -131,10 +131,10 @@ def copy_to_clipboard(text: str) -> None:
         # Auto-paste if enabled
         if AUTO_PASTE:
             import time
-            time.sleep(0.1)  # Brief delay to ensure clipboard is populated
+            time.sleep(0.2)  # Brief delay to ensure clipboard is populated
             try:
                 subprocess.run(
-                    ['xdotool', 'key', 'ctrl+v'],
+                    ['xdotool', 'type', '--clearmodifiers', text],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
