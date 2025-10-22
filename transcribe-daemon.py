@@ -276,10 +276,14 @@ class TranscriptionDaemon:
 
     def stop_and_process(self) -> None:
         """Stop recording and process."""
+        logger.info("stop_and_process called")
         audio_path = self.recorder.stop_recording()
         if audio_path:
             self.current_audio_file = audio_path
-            threading.Thread(target=self._process_audio, daemon=True).start()
+            logger.info("Processing audio synchronously...")
+            # Process synchronously, not in background thread
+            self._process_audio()
+            logger.info("Processing complete")
 
     def cleanup(self) -> None:
         """Cleanup resources."""
