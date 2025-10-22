@@ -110,13 +110,13 @@ class AudioRecorderDaemon:
         else:
             logger.error(f"Audio file not found: {self.output_file}")
 
-        self._notify("⏹️  Recording stopped")
+        # Removed "Recording stopped" notification - goes straight to transcribing
         return self.output_file
 
     def _notify(self, message: str) -> None:
         """Send desktop notification that replaces previous ones."""
         subprocess.run(
-            ['notify-send', '-t', '2000', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
+            ['notify-send', '-t', '1500', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -153,8 +153,7 @@ class TranscriptionPipeline:
         """Full pipeline: transcribe + polish."""
         logger.info(f"Processing audio file: {audio_path}")
 
-        # Transcribe
-        self._notify("🔄 Transcribing...")
+        # Transcribe (no notification - happens fast)
         logger.info("Starting Whisper transcription...")
 
         try:
@@ -179,7 +178,7 @@ class TranscriptionPipeline:
         # Polish if enabled
         if ENABLE_POLISHING and self.openai:
             logger.info("Polishing with GPT...")
-            self._notify("✨ Polishing...")
+            # No notification for polishing - happens fast
             try:
                 response = self.openai.chat.completions.create(
                     model=OPENAI_MODEL,
@@ -232,7 +231,7 @@ class TranscriptionPipeline:
     def _notify(self, message: str) -> None:
         """Send desktop notification that replaces previous ones."""
         subprocess.run(
-            ['notify-send', '-t', '3000', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
+            ['notify-send', '-t', '1500', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
