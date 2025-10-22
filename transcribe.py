@@ -71,8 +71,16 @@ class WhisperTranscriber:
     def transcribe(self, audio_file: str) -> str:
         """Transcribe audio file to text."""
         print("🔄 Transcribing...", file=sys.stderr)
-        segments, info = self.model.transcribe(audio_file, beam_size=5)
-        text = " ".join([segment.text.strip() for segment in segments])
+        try:
+            segments, info = self.model.transcribe(audio_file, beam_size=5)
+            text = " ".join([segment.text.strip() for segment in segments])
+        except ValueError as e:
+            print("⚠️  No speech detected (empty audio)", file=sys.stderr)
+            return ""
+        except Exception as e:
+            print(f"❌ Transcription error: {e}", file=sys.stderr)
+            return ""
+
         print(f"📝 Raw transcription: {text}", file=sys.stderr)
         return text
 

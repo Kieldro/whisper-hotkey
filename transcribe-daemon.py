@@ -111,8 +111,16 @@ class TranscriptionPipeline:
         """Full pipeline: transcribe + polish."""
         # Transcribe
         self._notify("🔄 Transcribing...")
-        segments, _ = self.whisper.transcribe(audio_path, beam_size=5)
-        raw_text = " ".join([seg.text.strip() for seg in segments])
+        try:
+            segments, _ = self.whisper.transcribe(audio_path, beam_size=5)
+            raw_text = " ".join([seg.text.strip() for seg in segments])
+        except ValueError as e:
+            # Empty audio or no detectable language
+            self._notify("⚠️  No speech detected (empty audio)")
+            return ""
+        except Exception as e:
+            self._notify(f"❌ Transcription error: {str(e)[:50]}")
+            return ""
 
         if not raw_text.strip():
             self._notify("⚠️  No speech detected")
