@@ -129,7 +129,7 @@ class TranscriptionPipeline:
 
     def __init__(self):
         logger.info(f"Initializing TranscriptionPipeline (model={WHISPER_MODEL}, device={DEVICE}, polishing={ENABLE_POLISHING})")
-        self._notify("📥 Loading models...")
+        # Removed loading notification - loads in background silently
 
         logger.info("Loading Whisper model...")
         self.whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
@@ -138,10 +138,8 @@ class TranscriptionPipeline:
         if ENABLE_POLISHING:
             logger.info("Initializing OpenAI client...")
             self.openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            self._notify("✅ Models loaded (with polishing)")
         else:
             self.openai = None
-            self._notify("✅ Whisper loaded (local-only mode)")
 
         logger.info("TranscriptionPipeline initialized")
 
