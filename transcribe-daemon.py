@@ -86,6 +86,7 @@ class AudioRecorderDaemon:
 
         self.is_recording = True
         logger.info(f"Recording started, parecord PID: {self.process.pid}")
+        self._play_sound('/usr/share/sounds/freedesktop/stereo/message-new-instant.oga')
         self._notify("🎤 Recording...")
 
     def stop_recording(self) -> Optional[str]:
@@ -110,6 +111,8 @@ class AudioRecorderDaemon:
         else:
             logger.error(f"Audio file not found: {self.output_file}")
 
+        # Play stop sound
+        self._play_sound('/usr/share/sounds/freedesktop/stereo/complete.oga')
         # Removed "Recording stopped" notification - goes straight to transcribing
         return self.output_file
 
@@ -120,6 +123,17 @@ class AudioRecorderDaemon:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+
+    def _play_sound(self, sound_file: str) -> None:
+        """Play a sound file using paplay."""
+        if os.path.exists(sound_file):
+            subprocess.Popen(
+                ['paplay', sound_file],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:
+            logger.warning(f"Sound file not found: {sound_file}")
 
     def cleanup(self) -> None:
         """Cleanup audio resources."""
