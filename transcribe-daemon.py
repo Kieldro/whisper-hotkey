@@ -46,6 +46,19 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))  # seconds
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
 
+# Detect session type for clipboard/typing
+def detect_session_type():
+    """Detect if running under X11 or Wayland."""
+    session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
+    wayland_display = os.getenv("WAYLAND_DISPLAY", "")
+
+    if session_type == "wayland" or wayland_display:
+        return "wayland"
+    return "x11"
+
+SESSION_TYPE = detect_session_type()
+logger.info(f"Detected session type: {SESSION_TYPE}")
+
 
 class AudioRecorderDaemon:
     """Non-blocking audio recorder using parecord."""
@@ -225,24 +238,41 @@ class TranscriptionPipeline:
 
         # Copy to clipboard
         logger.info("Copying to clipboard...")
-        subprocess.run(
-            ['xclip', '-selection', 'clipboard'],
-            input=final_text.encode(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        if SESSION_TYPE == "wayland":
+            subprocess.run(
+                ['wl-copy'],
+                input=final_text.encode(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:  # X11
+            subprocess.run(
+                ['xclip', '-selection', 'clipboard'],
+                input=final_text.encode(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
         logger.info("Copied to clipboard")
 
         # Auto-paste if enabled
         if AUTO_PASTE:
-            logger.info("Auto-pasting with xdotool type...")
             time.sleep(0.2)  # Brief delay
-            result = subprocess.run(
-                ['xdotool', 'type', '--clearmodifiers', final_text],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            logger.info(f"xdotool type exit code: {result.returncode}")
+            if SESSION_TYPE == "wayland":
+                logger.info("Auto-pasting with ydotool type...")
+                result = subprocess.run(
+                    ['ydotool', 'type', final_text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                logger.info(f"ydotool type exit code: {result.returncode}")
+            else:  # X11
+                logger.info("Auto-pasting with xdotool type...")
+                result = subprocess.run(
+                    ['xdotool', 'type', '--clearmodifiers', final_text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                logger.info(f"xdotool type exit code: {result.returncode}")
             self._notify(f"✅ Pasted: {final_text[:50]}...")
         else:
             logger.info("Auto-paste disabled")

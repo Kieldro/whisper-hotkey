@@ -29,6 +29,7 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 - **Two usage modes**: Simple (terminal-based) or Daemon (push-to-talk)
 - **Hotkey trigger**: Integrates with i3/sway/KDE/GNOME
 - **Desktop notifications**: Visual feedback during processing (daemon mode)
+- **X11 and Wayland support**: Auto-detects session type and uses appropriate tools
 - **Low latency**: ~2s local-only, ~3-5s with polishing
 
 ## Usage Modes
@@ -59,8 +60,8 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 **Minimum (local-only mode):**
 - Python 3.8+
 - PulseAudio or PipeWire (for audio recording)
-- xclip (for clipboard support)
-- xdotool (for auto-paste)
+- **X11**: xclip (clipboard) + xdotool (auto-paste)
+- **Wayland**: wl-clipboard (clipboard) + ydotool (auto-paste)
 
 **Optional (for polishing):**
 - OpenAI API key (get one at https://platform.openai.com/api-keys)
@@ -70,14 +71,29 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 ### 1. Install System Dependencies
 
 ```bash
-# Debian/Ubuntu
+# Debian/Ubuntu (X11)
 sudo apt install python3-venv python3-pip portaudio19-dev xclip xdotool libnotify-bin
 
-# Arch Linux
+# Debian/Ubuntu (Wayland)
+sudo apt install python3-venv python3-pip portaudio19-dev wl-clipboard ydotool libnotify-bin
+
+# Arch Linux (X11)
 sudo pacman -S python python-pip portaudio xclip xdotool libnotify
 
-# Fedora
+# Arch Linux (Wayland)
+sudo pacman -S python python-pip portaudio wl-clipboard ydotool libnotify
+
+# Fedora (X11)
 sudo dnf install python3-virtualenv portaudio-devel xclip xdotool libnotify
+
+# Fedora (Wayland)
+sudo dnf install python3-virtualenv portaudio-devel wl-clipboard ydotool libnotify
+```
+
+**Note**: The script auto-detects X11 vs Wayland. For Wayland, `ydotool` may require additional setup:
+```bash
+# Enable ydotool service (Wayland only)
+sudo systemctl enable --now ydotool
 ```
 
 ### 2. Clone and Setup
