@@ -52,16 +52,29 @@ CHUNK_SIZE = 1024
 
 # Detect session type for clipboard/typing
 def detect_session_type():
-    """Detect if running under X11 or Wayland."""
-    session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
-    wayland_display = os.getenv("WAYLAND_DISPLAY", "")
+    """Detect which clipboard/typing tools are available."""
+    import shutil
 
-    if session_type == "wayland" or wayland_display:
+    # Check if Wayland tools are available
+    has_wl_copy = shutil.which("wl-copy") is not None
+    has_ydotool = shutil.which("ydotool") is not None
+
+    # Check if X11 tools are available
+    has_xclip = shutil.which("xclip") is not None
+    has_xdotool = shutil.which("xdotool") is not None
+
+    # Prefer Wayland tools if available, otherwise fall back to X11
+    if has_wl_copy and has_ydotool:
         return "wayland"
-    return "x11"
+    elif has_xclip and has_xdotool:
+        return "x11"
+    else:
+        # Log what's missing
+        logger.warning("Missing clipboard/typing tools. Install either (wl-copy + ydotool) or (xclip + xdotool)")
+        return "x11"  # Default to X11
 
 SESSION_TYPE = detect_session_type()
-logger.info(f"Detected session type: {SESSION_TYPE}")
+logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
 
 
 class PreRecordingBuffer:
@@ -339,7 +352,7 @@ class TranscriptionPipeline:
                 vad_filter=True,
                 vad_parameters=dict(
                     min_silence_duration_ms=500,  # Require 500ms silence to split segments
-                    speech_pad_ms=400,  # Pad speech segments by 400ms on each side
+                    speech_pad_ms=2000,  # Pad speech segments by 2s on each side to capture trailing words
                 )
             )
             raw_text = " ".join([seg.text.strip() for seg in segments])
@@ -554,11 +567,7 @@ def main():
             if os.path.exists(state_file):
                 os.unlink(state_file)
 
-    # Start persistent daemon
-    logger.info("Starting persistent daemon (will stay alive for 10 minutes after last use)")
-    daemon = TranscriptionDaemon()
-
-    # Write our PID to daemon file
+    # Write our PID to daemon file FIRST (before slow initialization)
     with open(daemon_running_file, 'w') as f:
         f.write(str(os.getpid()))
     logger.info(f"Wrote daemon PID to {daemon_running_file}")
@@ -585,6 +594,17 @@ def main():
     signal.signal(signal.SIGTERM, handle_shutdown)  # Shutdown daemon
     signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
     logger.info("Signal handlers registered")
+
+    # Start persistent daemon (slow: loads Whisper model)
+    logger.info("Starting persistent daemon (will stay alive for 10 minutes after last use)")
+    logger.info("Loading Whisper model... (this may take a few seconds on first start)")
+    daemon = TranscriptionDaemon()
+
+    # Immediately start recording (since we're starting fresh daemon)
+    logger.info("Auto-starting recording on fresh daemon start")
+    Path(state_file).touch()  # Mark as recording
+    daemon.start_recording()
+    daemon.last_activity_time = time.time()
 
     try:
         logger.info("Daemon loop started, model loaded and ready")
