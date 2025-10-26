@@ -11,6 +11,9 @@ import subprocess
 import threading
 import signal
 import logging
+import wave
+import pyaudio
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -43,6 +46,7 @@ ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))  # seconds
+PRE_RECORDING_BUFFER = int(os.getenv("PRE_RECORDING_BUFFER", "2"))  # seconds
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
 
@@ -60,17 +64,101 @@ SESSION_TYPE = detect_session_type()
 logger.info(f"Detected session type: {SESSION_TYPE}")
 
 
+class PreRecordingBuffer:
+    """Continuously buffers audio in memory to capture pre-hotkey speech."""
+
+    def __init__(self, duration: int = PRE_RECORDING_BUFFER, sample_rate: int = SAMPLE_RATE, chunk_size: int = CHUNK_SIZE):
+        self.duration = duration
+        self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
+        self.enabled = duration > 0
+
+        if not self.enabled:
+            logger.info("Pre-recording buffer disabled (duration = 0)")
+            return
+
+        # Calculate buffer size (number of chunks to keep)
+        chunks_per_second = sample_rate / chunk_size
+        self.max_chunks = int(chunks_per_second * duration)
+
+        # Circular buffer for audio chunks
+        self.buffer = deque(maxlen=self.max_chunks)
+        self.is_running = False
+        self.thread: Optional[threading.Thread] = None
+        self.audio = None
+        self.stream = None
+
+        logger.info(f"Pre-recording buffer initialized: {duration}s ({self.max_chunks} chunks)")
+
+    def start(self) -> None:
+        """Start continuous background recording."""
+        if not self.enabled or self.is_running:
+            return
+
+        try:
+            self.audio = pyaudio.PyAudio()
+            self.stream = self.audio.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.sample_rate,
+                input=True,
+                frames_per_buffer=self.chunk_size
+            )
+            self.is_running = True
+            self.thread = threading.Thread(target=self._record_loop, daemon=True)
+            self.thread.start()
+            logger.info("Pre-recording buffer started")
+        except Exception as e:
+            logger.error(f"Failed to start pre-recording buffer: {e}")
+            self.enabled = False
+
+    def _record_loop(self) -> None:
+        """Continuously record audio into circular buffer."""
+        while self.is_running:
+            try:
+                data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+                self.buffer.append(data)
+            except Exception as e:
+                logger.error(f"Error in pre-recording buffer: {e}")
+                break
+
+    def get_buffered_audio(self) -> bytes:
+        """Get all buffered audio as bytes."""
+        if not self.enabled or not self.buffer:
+            return b''
+        return b''.join(self.buffer)
+
+    def stop(self) -> None:
+        """Stop the buffer and cleanup resources."""
+        if not self.enabled:
+            return
+
+        self.is_running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+
+        if self.audio:
+            self.audio.terminate()
+
+        logger.info("Pre-recording buffer stopped")
+
+
 class AudioRecorderDaemon:
     """Non-blocking audio recorder using parecord."""
 
     # Shared notification ID for replacing notifications
     NOTIFICATION_ID = 999999
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE):
+    def __init__(self, sample_rate: int = SAMPLE_RATE, pre_buffer: Optional['PreRecordingBuffer'] = None):
         self.sample_rate = sample_rate
         self.is_recording = False
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
+        self.pre_buffer = pre_buffer
 
     def start_recording(self) -> None:
         """Start recording with parecord."""
@@ -78,7 +166,25 @@ class AudioRecorderDaemon:
             logger.warning("Already recording, ignoring start request")
             return
 
-        # Create temp file
+        # Save pre-buffered audio if available
+        self.pre_buffer_file = None
+        if self.pre_buffer and self.pre_buffer.enabled:
+            buffered_audio = self.pre_buffer.get_buffered_audio()
+            if buffered_audio:
+                # Write buffered audio to temp WAV file
+                temp_buffer = tempfile.NamedTemporaryFile(suffix='_buffer.wav', delete=False)
+                self.pre_buffer_file = temp_buffer.name
+                temp_buffer.close()
+
+                with wave.open(self.pre_buffer_file, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)  # 16-bit = 2 bytes
+                    wf.setframerate(self.sample_rate)
+                    wf.writeframes(buffered_audio)
+
+                logger.info(f"Saved {len(buffered_audio)} bytes of pre-buffered audio to {self.pre_buffer_file}")
+
+        # Create temp file for new recording
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         self.output_file = temp_file.name
         temp_file.close()
@@ -118,10 +224,21 @@ class AudioRecorderDaemon:
             self.process.wait(timeout=2)
             logger.info("parecord terminated")
 
+        # Merge pre-buffered audio with new recording if needed
+        if self.pre_buffer_file and os.path.exists(self.pre_buffer_file):
+            logger.info("Merging pre-buffered audio with recording...")
+            merged_file = self._merge_audio_files(self.pre_buffer_file, self.output_file)
+            if merged_file:
+                # Clean up temp files
+                os.unlink(self.pre_buffer_file)
+                os.unlink(self.output_file)
+                self.output_file = merged_file
+                logger.info(f"Merged audio file: {merged_file}")
+
         # Check file size
         if self.output_file and os.path.exists(self.output_file):
             file_size = os.path.getsize(self.output_file)
-            logger.info(f"Recorded audio file: {self.output_file} ({file_size} bytes)")
+            logger.info(f"Final audio file: {self.output_file} ({file_size} bytes)")
         else:
             logger.error(f"Audio file not found: {self.output_file}")
 
@@ -129,6 +246,37 @@ class AudioRecorderDaemon:
         self._play_sound('/usr/share/sounds/freedesktop/stereo/complete.oga')
         # Removed "Recording stopped" notification - goes straight to transcribing
         return self.output_file
+
+    def _merge_audio_files(self, file1: str, file2: str) -> Optional[str]:
+        """Merge two WAV files into one."""
+        try:
+            # Read first file
+            with wave.open(file1, 'rb') as wf1:
+                params1 = wf1.getparams()
+                frames1 = wf1.readframes(wf1.getnframes())
+
+            # Read second file
+            with wave.open(file2, 'rb') as wf2:
+                params2 = wf2.getparams()
+                frames2 = wf2.readframes(wf2.getnframes())
+
+            # Verify compatibility
+            if params1[:3] != params2[:3]:  # channels, sampwidth, framerate
+                logger.error("Audio files have incompatible parameters")
+                return None
+
+            # Write merged file
+            merged_file = tempfile.NamedTemporaryFile(suffix='_merged.wav', delete=False).name
+            with wave.open(merged_file, 'wb') as wf_out:
+                wf_out.setparams(params1)
+                wf_out.writeframes(frames1 + frames2)
+
+            logger.info(f"Successfully merged audio files: {len(frames1)} + {len(frames2)} bytes")
+            return merged_file
+
+        except Exception as e:
+            logger.error(f"Failed to merge audio files: {e}")
+            return None
 
     def _notify(self, message: str) -> None:
         """Send desktop notification that replaces previous ones."""
@@ -294,7 +442,11 @@ class TranscriptionDaemon:
     """Background daemon handling recording and transcription."""
 
     def __init__(self):
-        self.recorder = AudioRecorderDaemon()
+        # Initialize pre-recording buffer
+        self.pre_buffer = PreRecordingBuffer()
+        self.pre_buffer.start()
+
+        self.recorder = AudioRecorderDaemon(pre_buffer=self.pre_buffer)
         self.pipeline = TranscriptionPipeline()
         self.current_audio_file: Optional[str] = None
         self.last_activity_time = time.time()
@@ -354,6 +506,8 @@ class TranscriptionDaemon:
     def cleanup(self) -> None:
         """Cleanup resources."""
         self.recorder.cleanup()
+        if self.pre_buffer:
+            self.pre_buffer.stop()
 
 
 def main():

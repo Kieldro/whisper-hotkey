@@ -25,6 +25,7 @@ Linux implementation of Superwhisper-style voice transcription using faster-whis
 - **Local transcription**: Uses faster-whisper (Whisper small model, ~500MB)
 - **Optional cloud polishing**: GPT-4o mini corrects grammar and formatting (disabled by default)
 - **Auto-paste**: Automatically pastes transcription into active window (enabled by default)
+- **Pre-recording buffer**: Captures audio before hotkey press (2s default)
 - **Works offline**: Local-only mode requires no internet or API keys
 - **Two usage modes**: Simple (terminal-based) or Daemon (push-to-talk)
 - **Hotkey trigger**: Integrates with i3/sway/KDE/GNOME
@@ -186,12 +187,14 @@ Edit `.env` to customize:
 | Variable | Default | Options | Notes |
 |----------|---------|---------|-------|
 | `ENABLE_POLISHING` | `false` | `true`, `false` | Enable GPT polishing (requires API key) |
-| `AUTO_PASTE` | `true` | `true`, `false` | Automatically paste transcription (requires xdotool) |
+| `AUTO_PASTE` | `true` | `true`, `false` | Automatically paste transcription (requires xdotool/ydotool) |
+| `PRE_RECORDING_BUFFER` | `2` | `0-10` (seconds) | Capture audio before hotkey press (0 = disabled) |
 | `OPENAI_API_KEY` | - | Your API key | Only needed if polishing enabled |
 | `WHISPER_MODEL` | `small` | `tiny`, `base`, `small`, `medium`, `large-v3` | Affects accuracy and speed |
 | `DEVICE` | `cpu` | `cpu`, `cuda` | Use `cuda` for GPU acceleration |
 | `COMPUTE_TYPE` | `int8` | `int8`, `float16`, `float32` | Lower = faster, less accurate |
 | `OPENAI_MODEL` | `gpt-4o-mini` | `gpt-4o-mini`, `gpt-4o` | Only used if polishing enabled |
+| `IDLE_TIMEOUT` | `600` | `0` or seconds | Model stays in VRAM (0 = never timeout) |
 
 ### Model Comparison
 
