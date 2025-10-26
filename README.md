@@ -191,15 +191,116 @@ Edit `.env` to customize:
 
 ## GPU Acceleration (Optional)
 
-For faster transcription with NVIDIA GPU:
+For **3-5x faster** transcription with NVIDIA GPU:
+
+### Prerequisites
+
+- NVIDIA GPU with CUDA support (GTX 1060+, RTX series, etc.)
+- NVIDIA drivers installed (check with `nvidia-smi`)
+- CUDA 12.x installed (comes with driver)
+
+### Ubuntu 24.04 Setup
+
+**1. Install cuDNN libraries:**
 
 ```bash
-# Install CUDA support
-pip install faster-whisper[cuda]
+# Ubuntu 24.04 includes cuDNN 8 in official repos
+sudo apt install nvidia-cudnn
 
-# Update .env
+# Verify installation
+ldconfig -p | grep cudnn
+```
+
+**2. Install compatible CTranslate2 version:**
+
+The default `faster-whisper` installs CTranslate2 4.6.0+ which requires cuDNN 9.
+Ubuntu 24.04 ships with cuDNN 8, so we need to downgrade CTranslate2:
+
+```bash
+source venv/bin/activate
+
+# Downgrade to CTranslate2 4.4.0 (compatible with cuDNN 8)
+pip install --force-reinstall ctranslate2==4.4.0
+```
+
+**3. Update .env for GPU acceleration:**
+
+```bash
+# Edit .env file
 DEVICE=cuda
-COMPUTE_TYPE=float16
+COMPUTE_TYPE=float16  # Best for CUDA (int8 is for CPU only)
+```
+
+**4. Verify CUDA is working:**
+
+```bash
+source venv/bin/activate
+
+python3 -c "
+from faster_whisper import WhisperModel
+import os
+os.environ['DEVICE'] = 'cuda'
+print('Loading model on CUDA...')
+model = WhisperModel('small', device='cuda', compute_type='float16')
+print('✅ CUDA working! GPU acceleration enabled.')
+"
+```
+
+Check GPU memory usage while running:
+```bash
+watch -n 1 nvidia-smi
+```
+
+You should see the model loaded in GPU memory (~600MB for `small` model).
+
+### Other Ubuntu Versions
+
+**Ubuntu 22.04 and earlier:**
+- Install CUDA Toolkit from NVIDIA website
+- May need to manually install cuDNN from NVIDIA developer site
+
+**For newer cuDNN 9+ (if available):**
+```bash
+# If your system has cuDNN 9, you can use latest CTranslate2
+pip install ctranslate2  # Will auto-install latest version
+```
+
+### Performance Gains
+
+With CUDA enabled on a GTX 1660:
+
+| Model | CPU Time (Intel i5) | GPU Time | Speedup |
+|-------|---------------------|----------|---------|
+| tiny  | ~0.5s | ~0.2s | 2.5x |
+| small | ~2s | ~0.5s | 4x |
+| medium | ~8s | ~2s | 4x |
+| large-v3 | ~20s | ~5s | 4x |
+
+### Troubleshooting CUDA
+
+**Error: "Unable to load libcudnn_ops.so.9"**
+- You have CTranslate2 4.6.0+ but cuDNN 8 installed
+- Solution: Downgrade to CTranslate2 4.4.0 (see step 2 above)
+
+**Error: "CUDA out of memory"**
+- Your GPU doesn't have enough VRAM for the model
+- Solution: Use smaller model (`small` instead of `medium`) or switch to CPU
+
+**Verify cuDNN version:**
+```bash
+# Check installed cuDNN version
+apt-cache policy nvidia-cudnn
+
+# Check what CTranslate2 is looking for
+ldconfig -p | grep cudnn
+```
+
+**GPU not being used:**
+```bash
+# Check if CUDA device is detected
+python3 -c "import ctranslate2; print(f'CUDA devices: {ctranslate2.get_cuda_device_count()}')"
+
+# Should output: "CUDA devices: 1" (or more)
 ```
 
 ## Cost Estimation

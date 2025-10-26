@@ -1,3 +1,4 @@
 faster-whisper==1.0.3
+ctranslate2==4.4.0  # Pinned for Ubuntu 24.04 cuDNN 8 compatibility (4.6.0+ requires cuDNN 9)
 openai>=1.0.0
 python-dotenv

@@ -42,6 +42,7 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))  # seconds
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
 
@@ -171,7 +172,15 @@ class TranscriptionPipeline:
         logger.info("Starting Whisper transcription...")
 
         try:
-            segments, _ = self.whisper.transcribe(audio_path, beam_size=5)
+            segments, _ = self.whisper.transcribe(
+                audio_path,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,  # Require 500ms silence to split segments
+                    speech_pad_ms=400,  # Pad speech segments by 400ms on each side
+                )
+            )
             raw_text = " ".join([seg.text.strip() for seg in segments])
             logger.info(f"Transcription complete. Raw text: '{raw_text}'")
         except ValueError as e:
@@ -258,6 +267,8 @@ class TranscriptionDaemon:
         self.recorder = AudioRecorderDaemon()
         self.pipeline = TranscriptionPipeline()
         self.current_audio_file: Optional[str] = None
+        self.last_activity_time = time.time()
+        self.idle_timeout = IDLE_TIMEOUT
 
     def toggle_recording(self) -> None:
         """Toggle recording state (for push-to-talk)."""
@@ -294,6 +305,7 @@ class TranscriptionDaemon:
     def stop_and_process(self) -> None:
         """Stop recording and process."""
         logger.info("stop_and_process called")
+        self.last_activity_time = time.time()  # Update activity time
         audio_path = self.recorder.stop_recording()
         if audio_path:
             self.current_audio_file = audio_path
@@ -301,6 +313,13 @@ class TranscriptionDaemon:
             # Process synchronously, not in background thread
             self._process_audio()
             logger.info("Processing complete")
+
+    def is_idle_timeout_exceeded(self) -> bool:
+        """Check if daemon has been idle too long."""
+        if self.idle_timeout == 0:
+            return False  # Never timeout if set to 0
+        idle_time = time.time() - self.last_activity_time
+        return idle_time > self.idle_timeout
 
     def cleanup(self) -> None:
         """Cleanup resources."""
@@ -319,63 +338,96 @@ def main():
         sys.exit(1)
 
     state_file = "/tmp/whisper-hotkey-state"
-    pid_file = "/tmp/whisper-hotkey-pid"
+    daemon_running_file = "/tmp/whisper-hotkey-daemon-running"
 
-    if os.path.exists(state_file):
-        # Already recording, send signal to stop
-        logger.info("State file exists, sending stop signal to existing process")
+    # Check if persistent daemon is already running
+    if os.path.exists(daemon_running_file):
         try:
-            with open(pid_file, 'r') as f:
-                pid = int(f.read().strip())
-            logger.info(f"Sending SIGUSR1 to PID {pid}")
-            os.kill(pid, signal.SIGUSR1)  # Signal to stop recording
-            os.unlink(state_file)
-            os.unlink(pid_file)
-            logger.info("Stop signal sent successfully")
-        except (FileNotFoundError, ProcessLookupError, ValueError) as e:
-            # Process already dead, clean up
-            logger.warning(f"Could not signal process: {e}. Cleaning up state files.")
+            with open(daemon_running_file, 'r') as f:
+                daemon_pid = int(f.read().strip())
+
+            # Check if it's actually alive
+            os.kill(daemon_pid, 0)  # Raises error if process doesn't exist
+
+            # Daemon is alive, check if we're starting or stopping recording
+            if os.path.exists(state_file):
+                # Currently recording, send stop signal
+                logger.info(f"Sending stop signal to daemon PID {daemon_pid}")
+                os.kill(daemon_pid, signal.SIGUSR1)
+                os.unlink(state_file)
+            else:
+                # Start new recording
+                logger.info(f"Sending start signal to daemon PID {daemon_pid}")
+                Path(state_file).touch()
+                os.kill(daemon_pid, signal.SIGUSR2)
+            sys.exit(0)
+
+        except (FileNotFoundError, ProcessLookupError, ValueError, OSError):
+            # Daemon died, clean up and start new one
+            logger.warning("Daemon PID file exists but process is dead, starting new daemon")
+            if os.path.exists(daemon_running_file):
+                os.unlink(daemon_running_file)
             if os.path.exists(state_file):
                 os.unlink(state_file)
-            if os.path.exists(pid_file):
-                os.unlink(pid_file)
-        sys.exit(0)
 
-    # Start new recording session
-    logger.info("Starting new recording session")
+    # Start persistent daemon
+    logger.info("Starting persistent daemon (will stay alive for 10 minutes after last use)")
     daemon = TranscriptionDaemon()
 
-    # Write our PID
-    with open(pid_file, 'w') as f:
+    # Write our PID to daemon file
+    with open(daemon_running_file, 'w') as f:
         f.write(str(os.getpid()))
-    logger.info(f"Wrote PID to {pid_file}")
+    logger.info(f"Wrote daemon PID to {daemon_running_file}")
 
-    Path(state_file).touch()
-    logger.info(f"Created state file: {state_file}")
+    # Signal handlers
+    start_recording_event = threading.Event()
+    stop_recording_event = threading.Event()
+    shutdown_event = threading.Event()
 
-    # Set up signal handler to stop recording
-    stop_requested = threading.Event()
+    def handle_start(signum, frame):
+        logger.info("Received start recording signal")
+        start_recording_event.set()
 
     def handle_stop(signum, frame):
-        logger.info(f"Received signal {signum}, stopping recording")
-        stop_requested.set()
+        logger.info("Received stop recording signal")
+        stop_recording_event.set()
 
-    signal.signal(signal.SIGUSR1, handle_stop)
-    logger.info("Signal handler registered")
+    def handle_shutdown(signum, frame):
+        logger.info("Received shutdown signal")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGUSR2, handle_start)  # Start recording
+    signal.signal(signal.SIGUSR1, handle_stop)   # Stop recording
+    signal.signal(signal.SIGTERM, handle_shutdown)  # Shutdown daemon
+    signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
+    logger.info("Signal handlers registered")
 
     try:
-        daemon.start_recording()
-        logger.info("Waiting for stop signal...")
+        logger.info("Daemon loop started, model loaded and ready")
 
-        # Wait for stop signal
-        stop_requested.wait()
+        while not shutdown_event.is_set():
+            # Check for start recording signal
+            if start_recording_event.is_set():
+                start_recording_event.clear()
+                daemon.start_recording()
+                daemon.last_activity_time = time.time()
 
-        logger.info("Stop signal received, processing recording...")
-        # Process the recording
-        daemon.stop_and_process()
+            # Check for stop recording signal
+            if stop_recording_event.is_set():
+                stop_recording_event.clear()
+                daemon.stop_and_process()
 
-    except KeyboardInterrupt:
-        logger.info("Received KeyboardInterrupt")
+            # Check for idle timeout
+            if daemon.is_idle_timeout_exceeded():
+                logger.info(f"Idle timeout exceeded ({daemon.idle_timeout}s), shutting down daemon")
+                break
+
+            # Wait for signals or timeout (efficient polling)
+            # Wakes immediately on signals, sleeps otherwise
+            shutdown_event.wait(timeout=0.1)
+
+        logger.info("Daemon loop exiting")
+
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
     finally:
@@ -384,9 +436,9 @@ def main():
         if os.path.exists(state_file):
             os.unlink(state_file)
             logger.info("Removed state file")
-        if os.path.exists(pid_file):
-            os.unlink(pid_file)
-            logger.info("Removed PID file")
+        if os.path.exists(daemon_running_file):
+            os.unlink(daemon_running_file)
+            logger.info("Removed daemon PID file")
         logger.info("=== Daemon exiting ===")
 
 
