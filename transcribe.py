@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 import subprocess
-import signal
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +28,23 @@ ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SAMPLE_RATE = 16000
+
+
+def detect_session_type() -> str:
+    """Detect X11 vs Wayland session."""
+    session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
+    wayland_display = os.getenv("WAYLAND_DISPLAY")
+    x11_display = os.getenv("DISPLAY")
+
+    if session_type == "wayland" or wayland_display:
+        return "wayland"
+    elif session_type == "x11" or x11_display:
+        return "x11"
+    else:
+        return "x11"  # Default to X11
+
+
+SESSION_TYPE = detect_session_type()
 
 
 class AudioRecorder:
@@ -117,15 +134,24 @@ class GPTPolisher:
 
 
 def copy_to_clipboard(text: str) -> None:
-    """Copy text to system clipboard using xclip."""
+    """Copy text to system clipboard (supports X11 and Wayland)."""
     try:
-        subprocess.run(
-            ['xclip', '-selection', 'clipboard'],
-            input=text.encode(),
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        if SESSION_TYPE == "wayland":
+            subprocess.run(
+                ['wl-copy'],
+                input=text.encode(),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:  # X11
+            subprocess.run(
+                ['xclip', '-selection', 'clipboard'],
+                input=text.encode(),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
         print("📋 Copied to clipboard", file=sys.stderr)
 
         # Auto-paste if enabled
@@ -133,21 +159,37 @@ def copy_to_clipboard(text: str) -> None:
             import time
             time.sleep(0.2)  # Brief delay to ensure clipboard is populated
             try:
-                subprocess.run(
-                    ['xdotool', 'type', '--clearmodifiers', text],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+                if SESSION_TYPE == "wayland":
+                    subprocess.run(
+                        ['ydotool', 'type', text],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                else:  # X11
+                    subprocess.run(
+                        ['xdotool', 'type', '--clearmodifiers', text],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
                 print("✅ Auto-pasted", file=sys.stderr)
             except subprocess.CalledProcessError:
-                print("⚠️  Failed to auto-paste (xdotool error)", file=sys.stderr)
+                tool = "ydotool" if SESSION_TYPE == "wayland" else "xdotool"
+                print(f"⚠️  Failed to auto-paste ({tool} error)", file=sys.stderr)
             except FileNotFoundError:
-                print("⚠️  xdotool not found. Install with: sudo apt install xdotool", file=sys.stderr)
+                if SESSION_TYPE == "wayland":
+                    print("⚠️  ydotool not found. Install with: sudo apt install ydotool", file=sys.stderr)
+                else:
+                    print("⚠️  xdotool not found. Install with: sudo apt install xdotool", file=sys.stderr)
     except subprocess.CalledProcessError:
-        print("⚠️  Failed to copy to clipboard (xclip not installed?)", file=sys.stderr)
+        tool = "wl-copy" if SESSION_TYPE == "wayland" else "xclip"
+        print(f"⚠️  Failed to copy to clipboard ({tool} not installed?)", file=sys.stderr)
     except FileNotFoundError:
-        print("⚠️  xclip not found. Install with: sudo apt install xclip", file=sys.stderr)
+        if SESSION_TYPE == "wayland":
+            print("⚠️  wl-copy not found. Install with: sudo apt install wl-clipboard", file=sys.stderr)
+        else:
+            print("⚠️  xclip not found. Install with: sudo apt install xclip", file=sys.stderr)
 
 
 def main():

@@ -13,6 +13,8 @@ import signal
 import logging
 import wave
 import pyaudio
+import fcntl
+import shutil
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -50,28 +52,72 @@ PRE_RECORDING_BUFFER = int(os.getenv("PRE_RECORDING_BUFFER", "2"))  # seconds
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
 
+# Sound file paths (optional - will skip if not found)
+SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+SOUND_STOP = os.getenv("SOUND_STOP", "/usr/share/sounds/freedesktop/stereo/complete.oga")
+
+# Shared notification ID for replacing notifications
+NOTIFICATION_ID = 999999
+
+
+def send_notification(message: str) -> None:
+    """Send desktop notification that replaces previous ones."""
+    try:
+        subprocess.run(
+            ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        pass  # notify-send not installed
+
+
+def play_sound(sound_file: str) -> None:
+    """Play a sound file using paplay (non-blocking, fails silently)."""
+    if not sound_file or not os.path.exists(sound_file):
+        return
+    try:
+        subprocess.Popen(
+            ['paplay', sound_file],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except FileNotFoundError:
+        pass  # paplay not installed
+
+
 # Detect session type for clipboard/typing
 def detect_session_type():
-    """Detect which clipboard/typing tools are available."""
-    import shutil
+    """Detect the actual running display server session."""
 
-    # Check if Wayland tools are available
-    has_wl_copy = shutil.which("wl-copy") is not None
-    has_ydotool = shutil.which("ydotool") is not None
+    # First, detect the actual running session using environment variables
+    session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
+    wayland_display = os.getenv("WAYLAND_DISPLAY")
+    x11_display = os.getenv("DISPLAY")
 
-    # Check if X11 tools are available
-    has_xclip = shutil.which("xclip") is not None
-    has_xdotool = shutil.which("xdotool") is not None
-
-    # Prefer Wayland tools if available, otherwise fall back to X11
-    if has_wl_copy and has_ydotool:
-        return "wayland"
-    elif has_xclip and has_xdotool:
-        return "x11"
+    # Determine session from environment
+    if session_type == "wayland" or wayland_display:
+        detected_session = "wayland"
+    elif session_type == "x11" or x11_display:
+        detected_session = "x11"
     else:
-        # Log what's missing
-        logger.warning("Missing clipboard/typing tools. Install either (wl-copy + ydotool) or (xclip + xdotool)")
-        return "x11"  # Default to X11
+        # Fallback: couldn't determine, default to X11
+        logger.warning("Could not detect session type from environment, defaulting to X11")
+        detected_session = "x11"
+
+    # Verify required tools are available for the detected session
+    if detected_session == "wayland":
+        has_wl_copy = shutil.which("wl-copy") is not None
+        has_ydotool = shutil.which("ydotool") is not None
+        if not (has_wl_copy and has_ydotool):
+            logger.warning("Wayland session detected but missing tools. Install: wl-clipboard ydotool")
+    else:  # X11
+        has_xclip = shutil.which("xclip") is not None
+        has_xdotool = shutil.which("xdotool") is not None
+        if not (has_xclip and has_xdotool):
+            logger.warning("X11 session detected but missing tools. Install: xclip xdotool")
+
+    return detected_session
 
 SESSION_TYPE = detect_session_type()
 logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
@@ -96,7 +142,8 @@ class PreRecordingBuffer:
 
         # Circular buffer for audio chunks
         self.buffer = deque(maxlen=self.max_chunks)
-        self.is_running = False
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.audio = None
         self.stream = None
@@ -105,11 +152,12 @@ class PreRecordingBuffer:
 
     def start(self) -> None:
         """Start continuous background recording."""
-        if not self.enabled or self.is_running:
+        if not self.enabled or self.thread is not None:
             return
 
         try:
             self.audio = pyaudio.PyAudio()
+            # Use smaller buffer and shorter timeout for responsive shutdown
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
                 channels=1,
@@ -117,7 +165,7 @@ class PreRecordingBuffer:
                 input=True,
                 frames_per_buffer=self.chunk_size
             )
-            self.is_running = True
+            self._stop_event.clear()
             self.thread = threading.Thread(target=self._record_loop, daemon=True)
             self.thread.start()
             logger.info("Pre-recording buffer started")
@@ -127,35 +175,58 @@ class PreRecordingBuffer:
 
     def _record_loop(self) -> None:
         """Continuously record audio into circular buffer."""
-        while self.is_running:
+        while not self._stop_event.is_set():
             try:
+                # Check if stream is still valid
+                if self.stream is None or not self.stream.is_active():
+                    break
                 data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                self.buffer.append(data)
+                with self._lock:
+                    self.buffer.append(data)
+            except OSError:
+                # Stream was closed
+                break
             except Exception as e:
                 logger.error(f"Error in pre-recording buffer: {e}")
                 break
 
     def get_buffered_audio(self) -> bytes:
         """Get all buffered audio as bytes."""
-        if not self.enabled or not self.buffer:
+        if not self.enabled:
             return b''
-        return b''.join(self.buffer)
+        with self._lock:
+            if not self.buffer:
+                return b''
+            return b''.join(self.buffer)
 
     def stop(self) -> None:
         """Stop the buffer and cleanup resources."""
         if not self.enabled:
             return
 
-        self.is_running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
+        # Signal thread to stop
+        self._stop_event.set()
 
+        # Close stream first to unblock the read() call
         if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
+        # Now join the thread (should exit quickly since stream is closed)
+        if self.thread:
+            self.thread.join(timeout=2.0)
+            self.thread = None
 
         if self.audio:
-            self.audio.terminate()
+            try:
+                self.audio.terminate()
+            except Exception:
+                pass
+            self.audio = None
 
         logger.info("Pre-recording buffer stopped")
 
@@ -163,21 +234,19 @@ class PreRecordingBuffer:
 class AudioRecorderDaemon:
     """Non-blocking audio recorder using parecord."""
 
-    # Shared notification ID for replacing notifications
-    NOTIFICATION_ID = 999999
-
     def __init__(self, sample_rate: int = SAMPLE_RATE, pre_buffer: Optional['PreRecordingBuffer'] = None):
         self.sample_rate = sample_rate
         self.is_recording = False
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
         self.pre_buffer = pre_buffer
+        self.pre_buffer_file: Optional[str] = None
 
-    def start_recording(self) -> None:
-        """Start recording with parecord."""
+    def start_recording(self) -> bool:
+        """Start recording with parecord. Returns True on success."""
         if self.is_recording:
             logger.warning("Already recording, ignoring start request")
-            return
+            return False
 
         # Save pre-buffered audio if available
         self.pre_buffer_file = None
@@ -205,22 +274,56 @@ class AudioRecorderDaemon:
 
         # Start parecord
         logger.info(f"Starting parecord (rate={self.sample_rate})")
-        self.process = subprocess.Popen(
-            [
-                'parecord',
-                '--format=s16le',
-                f'--rate={self.sample_rate}',
-                '--channels=1',
-                self.output_file
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        try:
+            self.process = subprocess.Popen(
+                [
+                    'parecord',
+                    '--format=s16le',
+                    f'--rate={self.sample_rate}',
+                    '--channels=1',
+                    self.output_file
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            # Verify process actually started
+            time.sleep(0.1)
+            if self.process.poll() is not None:
+                logger.error(f"parecord exited immediately with code {self.process.returncode}")
+                send_notification("❌ Recording failed (parecord error)")
+                self._cleanup_temp_files()
+                return False
+        except FileNotFoundError:
+            logger.error("parecord not found. Install pulseaudio-utils.")
+            send_notification("❌ parecord not found")
+            self._cleanup_temp_files()
+            return False
+        except Exception as e:
+            logger.error(f"Failed to start parecord: {e}")
+            send_notification(f"❌ Recording failed: {str(e)[:30]}")
+            self._cleanup_temp_files()
+            return False
 
         self.is_recording = True
         logger.info(f"Recording started, parecord PID: {self.process.pid}")
-        self._play_sound('/usr/share/sounds/freedesktop/stereo/message-new-instant.oga')
-        self._notify("🎤 Recording...")
+        play_sound(SOUND_START)
+        send_notification("🎤 Recording...")
+        return True
+
+    def _cleanup_temp_files(self) -> None:
+        """Clean up any temp files created during recording."""
+        if self.pre_buffer_file and os.path.exists(self.pre_buffer_file):
+            try:
+                os.unlink(self.pre_buffer_file)
+            except OSError:
+                pass
+            self.pre_buffer_file = None
+        if self.output_file and os.path.exists(self.output_file):
+            try:
+                os.unlink(self.output_file)
+            except OSError:
+                pass
+            self.output_file = None
 
     def stop_recording(self) -> Optional[str]:
         """Stop recording and return file path."""
@@ -234,8 +337,14 @@ class AudioRecorderDaemon:
         if self.process:
             logger.info(f"Terminating parecord process {self.process.pid}")
             self.process.terminate()
-            self.process.wait(timeout=2)
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                logger.warning("parecord didn't terminate, killing...")
+                self.process.kill()
+                self.process.wait()
             logger.info("parecord terminated")
+            self.process = None
 
         # Merge pre-buffered audio with new recording if needed
         if self.pre_buffer_file and os.path.exists(self.pre_buffer_file):
@@ -243,10 +352,17 @@ class AudioRecorderDaemon:
             merged_file = self._merge_audio_files(self.pre_buffer_file, self.output_file)
             if merged_file:
                 # Clean up temp files
-                os.unlink(self.pre_buffer_file)
-                os.unlink(self.output_file)
+                try:
+                    os.unlink(self.pre_buffer_file)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(self.output_file)
+                except OSError:
+                    pass
                 self.output_file = merged_file
                 logger.info(f"Merged audio file: {merged_file}")
+            self.pre_buffer_file = None
 
         # Check file size
         if self.output_file and os.path.exists(self.output_file):
@@ -256,12 +372,13 @@ class AudioRecorderDaemon:
             logger.error(f"Audio file not found: {self.output_file}")
 
         # Play stop sound
-        self._play_sound('/usr/share/sounds/freedesktop/stereo/complete.oga')
+        play_sound(SOUND_STOP)
         # Removed "Recording stopped" notification - goes straight to transcribing
         return self.output_file
 
     def _merge_audio_files(self, file1: str, file2: str) -> Optional[str]:
         """Merge two WAV files into one."""
+        merged_file = None
         try:
             # Read first file
             with wave.open(file1, 'rb') as wf1:
@@ -289,26 +406,13 @@ class AudioRecorderDaemon:
 
         except Exception as e:
             logger.error(f"Failed to merge audio files: {e}")
+            # Clean up partial merged file on failure
+            if merged_file and os.path.exists(merged_file):
+                try:
+                    os.unlink(merged_file)
+                except OSError:
+                    pass
             return None
-
-    def _notify(self, message: str) -> None:
-        """Send desktop notification that replaces previous ones."""
-        subprocess.run(
-            ['notify-send', '-t', '1500', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-    def _play_sound(self, sound_file: str) -> None:
-        """Play a sound file using paplay."""
-        if os.path.exists(sound_file):
-            subprocess.Popen(
-                ['paplay', sound_file],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        else:
-            logger.warning(f"Sound file not found: {sound_file}")
 
     def cleanup(self) -> None:
         """Cleanup audio resources."""
@@ -318,9 +422,6 @@ class AudioRecorderDaemon:
 
 class TranscriptionPipeline:
     """Handles transcription and polishing pipeline."""
-
-    # Shared notification ID for replacing notifications
-    NOTIFICATION_ID = 999999
 
     def __init__(self):
         logger.info(f"Initializing TranscriptionPipeline (model={WHISPER_MODEL}, device={DEVICE}, polishing={ENABLE_POLISHING})")
@@ -360,16 +461,16 @@ class TranscriptionPipeline:
         except ValueError as e:
             # Empty audio or no detectable language
             logger.warning(f"ValueError during transcription: {e}")
-            self._notify("⚠️  No speech detected (empty audio)")
+            send_notification("⚠️  No speech detected (empty audio)")
             return ""
         except Exception as e:
             logger.error(f"Transcription error: {e}", exc_info=True)
-            self._notify(f"❌ Transcription error: {str(e)[:50]}")
+            send_notification(f"❌ Transcription error: {str(e)[:50]}")
             return ""
 
         if not raw_text.strip():
             logger.warning("Transcription returned empty text")
-            self._notify("⚠️  No speech detected")
+            send_notification("⚠️  No speech detected")
             return ""
 
         # Polish if enabled
@@ -434,21 +535,13 @@ class TranscriptionPipeline:
                     stderr=subprocess.DEVNULL
                 )
                 logger.info(f"xdotool type exit code: {result.returncode}")
-            self._notify(f"✅ Pasted: {final_text[:50]}...")
+            send_notification(f"✅ Pasted: {final_text[:50]}...")
         else:
             logger.info("Auto-paste disabled")
-            self._notify(f"✅ Copied: {final_text[:50]}...")
+            send_notification(f"✅ Copied: {final_text[:50]}...")
 
         logger.info("Processing complete")
         return final_text
-
-    def _notify(self, message: str) -> None:
-        """Send desktop notification that replaces previous ones."""
-        subprocess.run(
-            ['notify-send', '-t', '1500', '-r', str(self.NOTIFICATION_ID), 'Voice Transcription', message],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
 
 
 class TranscriptionDaemon:
@@ -461,7 +554,8 @@ class TranscriptionDaemon:
 
         self.recorder = AudioRecorderDaemon(pre_buffer=self.pre_buffer)
         self.pipeline = TranscriptionPipeline()
-        self.current_audio_file: Optional[str] = None
+        self._audio_lock = threading.Lock()
+        self._current_audio_file: Optional[str] = None
         self.last_activity_time = time.time()
         self.idle_timeout = IDLE_TIMEOUT
 
@@ -474,28 +568,36 @@ class TranscriptionDaemon:
             # Stop recording and process
             audio_path = self.recorder.stop_recording()
             if audio_path:
-                self.current_audio_file = audio_path
+                with self._audio_lock:
+                    self._current_audio_file = audio_path
                 # Process in background thread
                 threading.Thread(target=self._process_audio, daemon=True).start()
 
     def _process_audio(self) -> None:
         """Process recorded audio in background."""
-        if not self.current_audio_file:
+        # Grab the file path under lock
+        with self._audio_lock:
+            audio_file = self._current_audio_file
+            self._current_audio_file = None
+
+        if not audio_file:
             return
 
         try:
-            result = self.pipeline.process(self.current_audio_file)
+            result = self.pipeline.process(audio_file)
             if result:
                 print(result, flush=True)
         finally:
             # Cleanup temp file
-            if os.path.exists(self.current_audio_file):
-                os.unlink(self.current_audio_file)
-            self.current_audio_file = None
+            if os.path.exists(audio_file):
+                try:
+                    os.unlink(audio_file)
+                except OSError:
+                    pass
 
-    def start_recording(self) -> None:
-        """Start recording."""
-        self.recorder.start_recording()
+    def start_recording(self) -> bool:
+        """Start recording. Returns True on success."""
+        return self.recorder.start_recording()
 
     def stop_and_process(self) -> None:
         """Stop recording and process."""
@@ -503,7 +605,8 @@ class TranscriptionDaemon:
         self.last_activity_time = time.time()  # Update activity time
         audio_path = self.recorder.stop_recording()
         if audio_path:
-            self.current_audio_file = audio_path
+            with self._audio_lock:
+                self._current_audio_file = audio_path
             logger.info("Processing audio synchronously...")
             # Process synchronously, not in background thread
             self._process_audio()
@@ -523,6 +626,36 @@ class TranscriptionDaemon:
             self.pre_buffer.stop()
 
 
+def acquire_daemon_lock(lock_file: str) -> Optional[int]:
+    """
+    Try to acquire exclusive lock on daemon file.
+    Returns file descriptor on success, None if another daemon holds the lock.
+    """
+    try:
+        fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # We got the lock - write our PID
+            os.ftruncate(fd, 0)
+            os.write(fd, str(os.getpid()).encode())
+            return fd
+        except BlockingIOError:
+            # Another process holds the lock
+            os.close(fd)
+            return None
+    except OSError:
+        return None
+
+
+def read_daemon_pid(lock_file: str) -> Optional[int]:
+    """Read PID from daemon lock file."""
+    try:
+        with open(lock_file, 'r') as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
 def main():
     """Run daemon in toggle mode (for hotkey integration)."""
     logger.info("=== Daemon started ===")
@@ -535,58 +668,69 @@ def main():
         sys.exit(1)
 
     state_file = "/tmp/whisper-hotkey-state"
-    daemon_running_file = "/tmp/whisper-hotkey-daemon-running"
+    daemon_lock_file = "/tmp/whisper-hotkey-daemon.lock"
 
-    # Check if persistent daemon is already running
-    if os.path.exists(daemon_running_file):
-        try:
-            with open(daemon_running_file, 'r') as f:
-                daemon_pid = int(f.read().strip())
+    # Try to acquire the daemon lock
+    lock_fd = acquire_daemon_lock(daemon_lock_file)
 
-            # Check if it's actually alive
-            os.kill(daemon_pid, 0)  # Raises error if process doesn't exist
+    if lock_fd is None:
+        # Another daemon is running, send it a signal
+        daemon_pid = read_daemon_pid(daemon_lock_file)
+        if daemon_pid:
+            try:
+                # Verify it's still alive
+                os.kill(daemon_pid, 0)
 
-            # Daemon is alive, check if we're starting or stopping recording
-            if os.path.exists(state_file):
-                # Currently recording, send stop signal
-                logger.info(f"Sending stop signal to daemon PID {daemon_pid}")
-                os.kill(daemon_pid, signal.SIGUSR1)
-                os.unlink(state_file)
-            else:
-                # Start new recording
-                logger.info(f"Sending start signal to daemon PID {daemon_pid}")
-                Path(state_file).touch()
-                os.kill(daemon_pid, signal.SIGUSR2)
-            sys.exit(0)
+                # Daemon is alive, check if we're starting or stopping recording
+                if os.path.exists(state_file):
+                    # Currently recording, send stop signal
+                    logger.info(f"Sending stop signal to daemon PID {daemon_pid}")
+                    os.kill(daemon_pid, signal.SIGUSR1)
+                    try:
+                        os.unlink(state_file)
+                    except OSError:
+                        pass
+                else:
+                    # Start new recording
+                    logger.info(f"Sending start signal to daemon PID {daemon_pid}")
+                    Path(state_file).touch()
+                    os.kill(daemon_pid, signal.SIGUSR2)
+                sys.exit(0)
 
-        except (FileNotFoundError, ProcessLookupError, ValueError, OSError):
-            # Daemon died, clean up and start new one
-            logger.warning("Daemon PID file exists but process is dead, starting new daemon")
-            if os.path.exists(daemon_running_file):
-                os.unlink(daemon_running_file)
-            if os.path.exists(state_file):
-                os.unlink(state_file)
+            except ProcessLookupError:
+                # Daemon died but still holds lock (shouldn't happen with flock)
+                logger.warning("Daemon PID exists but process is dead")
+                # Try again to acquire lock
+                lock_fd = acquire_daemon_lock(daemon_lock_file)
+                if lock_fd is None:
+                    logger.error("Could not acquire daemon lock")
+                    sys.exit(1)
+            except OSError as e:
+                logger.error(f"Failed to signal daemon: {e}")
+                sys.exit(1)
+        else:
+            logger.error("Could not read daemon PID")
+            sys.exit(1)
 
-    # Write our PID to daemon file FIRST (before slow initialization)
-    with open(daemon_running_file, 'w') as f:
-        f.write(str(os.getpid()))
-    logger.info(f"Wrote daemon PID to {daemon_running_file}")
+    # We now hold the lock
+    logger.info(f"Acquired daemon lock, PID written to {daemon_lock_file}")
 
-    # Signal handlers
+    # Signal handlers - use threading.Event for thread-safe signaling
+    # NOTE: Signal handlers should only set flags, not call complex functions like logging
     start_recording_event = threading.Event()
     stop_recording_event = threading.Event()
     shutdown_event = threading.Event()
 
     def handle_start(signum, frame):
-        logger.info("Received start recording signal")
+        # UNSAFE to log here - just set the flag
         start_recording_event.set()
 
     def handle_stop(signum, frame):
-        logger.info("Received stop recording signal")
+        # UNSAFE to log here - just set the flag
         stop_recording_event.set()
 
     def handle_shutdown(signum, frame):
-        logger.info("Received shutdown signal")
+        # UNSAFE to log here - just set the flag
         shutdown_event.set()
 
     signal.signal(signal.SIGUSR2, handle_start)  # Start recording
@@ -613,12 +757,14 @@ def main():
             # Check for start recording signal
             if start_recording_event.is_set():
                 start_recording_event.clear()
+                logger.info("Received start recording signal")
                 daemon.start_recording()
                 daemon.last_activity_time = time.time()
 
             # Check for stop recording signal
             if stop_recording_event.is_set():
                 stop_recording_event.clear()
+                logger.info("Received stop recording signal")
                 daemon.stop_and_process()
 
             # Check for idle timeout
@@ -637,12 +783,26 @@ def main():
     finally:
         logger.info("Cleaning up...")
         daemon.cleanup()
-        if os.path.exists(state_file):
-            os.unlink(state_file)
-            logger.info("Removed state file")
-        if os.path.exists(daemon_running_file):
-            os.unlink(daemon_running_file)
-            logger.info("Removed daemon PID file")
+        try:
+            if os.path.exists(state_file):
+                os.unlink(state_file)
+                logger.info("Removed state file")
+        except OSError:
+            pass
+        # Release the lock by closing the file descriptor
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+                logger.info("Released daemon lock")
+            except OSError:
+                pass
+        # Remove lock file
+        try:
+            if os.path.exists(daemon_lock_file):
+                os.unlink(daemon_lock_file)
+                logger.info("Removed daemon lock file")
+        except OSError:
+            pass
         logger.info("=== Daemon exiting ===")
 
 
