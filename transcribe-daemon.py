@@ -450,11 +450,7 @@ class TranscriptionPipeline:
             segments, _ = self.whisper.transcribe(
                 audio_path,
                 beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=500,  # Require 500ms silence to split segments
-                    speech_pad_ms=2000,  # Pad speech segments by 2s on each side to capture trailing words
-                )
+                vad_filter=False,  # Disabled - process entire audio without cutting
             )
             raw_text = " ".join([seg.text.strip() for seg in segments])
             logger.info(f"Transcription complete. Raw text: '{raw_text}'")
@@ -743,12 +739,10 @@ def main():
     logger.info("Starting persistent daemon (will stay alive for 10 minutes after last use)")
     logger.info("Loading Whisper model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
-
-    # Immediately start recording (since we're starting fresh daemon)
-    logger.info("Auto-starting recording on fresh daemon start")
-    Path(state_file).touch()  # Mark as recording
-    daemon.start_recording()
     daemon.last_activity_time = time.time()
+    
+    # Ready and waiting for hotkey
+    logger.info("Daemon ready, waiting for hotkey...")
 
     try:
         logger.info("Daemon loop started, model loaded and ready")
