@@ -12,7 +12,6 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-from faster_whisper import WhisperModel
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -21,6 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration
+ENGINE = os.getenv("ENGINE", "parakeet")  # whisper or parakeet
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")  # tiny, base, small, medium, large-v3
 DEVICE = os.getenv("DEVICE", "cpu")  # cpu or cuda
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")  # int8, float16, float32
@@ -78,19 +78,29 @@ class AudioRecorder:
 
 
 class WhisperTranscriber:
-    """Local transcription using faster-whisper."""
+    """Local transcription using faster-whisper or parakeet."""
 
     def __init__(self, model_name: str = WHISPER_MODEL, device: str = DEVICE, compute_type: str = COMPUTE_TYPE):
-        print(f"📥 Loading Whisper model: {model_name}...", file=sys.stderr)
-        self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        self.engine = ENGINE
+        if self.engine == "parakeet":
+            print("📥 Loading Parakeet TDT model...", file=sys.stderr)
+            import onnx_asr
+            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2")
+        else:
+            from faster_whisper import WhisperModel
+            print(f"📥 Loading Whisper model: {model_name}...", file=sys.stderr)
+            self.model = WhisperModel(model_name, device=device, compute_type=compute_type)
         print("✅ Model loaded", file=sys.stderr)
 
     def transcribe(self, audio_file: str) -> str:
         """Transcribe audio file to text."""
         print("🔄 Transcribing...", file=sys.stderr)
         try:
-            segments, info = self.model.transcribe(audio_file, beam_size=5)
-            text = " ".join([segment.text.strip() for segment in segments])
+            if self.engine == "parakeet":
+                text = self.model.recognize(audio_file)
+            else:
+                segments, info = self.model.transcribe(audio_file, beam_size=5)
+                text = " ".join([segment.text.strip() for segment in segments])
         except ValueError as e:
             print("⚠️  No speech detected (empty audio)", file=sys.stderr)
             return ""
