@@ -1,5 +1,6 @@
-faster-whisper==1.0.3
-ctranslate2==4.4.0  # Pinned for Ubuntu 24.04 cuDNN 8 compatibility (4.6.0+ requires cuDNN 9)
+faster-whisper==1.0.3  # Only needed for ENGINE=whisper
+ctranslate2==4.4.0  # Only needed for ENGINE=whisper (pinned for Ubuntu 24.04 cuDNN 8)
+# onnx-asr[hub] onnxruntime<1.21  # Only needed for ENGINE=parakeet (onnxruntime 1.21+ has HF symlink bug)
 openai>=1.0.0
 python-dotenv
 pyaudio  # For pre-recording buffer

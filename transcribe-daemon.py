@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from faster_whisper import WhisperModel
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
@@ -41,6 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
+ENGINE = os.getenv("ENGINE", "parakeet")  # whisper or parakeet
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 DEVICE = os.getenv("DEVICE", "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
@@ -59,6 +59,55 @@ SOUND_STOP = os.getenv("SOUND_STOP", "/usr/share/sounds/freedesktop/stereo/compl
 # Shared notification ID for replacing notifications
 NOTIFICATION_ID = 999999
 
+# Valid config values for validation
+VALID_WHISPER_MODELS = {
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
+    "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large",
+    "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
+}
+VALID_DEVICES = {"cpu", "cuda", "auto"}
+VALID_COMPUTE_TYPES = {
+    "int8", "int8_float16", "int8_float32", "int16",
+    "float16", "float32", "bfloat16", "auto",
+}
+
+
+VALID_ENGINES = {"whisper", "parakeet"}
+
+
+def validate_config() -> None:
+    """Validate all config values at startup. Exit with clear error on invalid values."""
+    errors = []
+
+    if ENGINE not in VALID_ENGINES:
+        errors.append(f"ENGINE='{ENGINE}' invalid. Valid: {sorted(VALID_ENGINES)}")
+
+    if not (0 <= PRE_RECORDING_BUFFER <= 10):
+        errors.append(f"PRE_RECORDING_BUFFER={PRE_RECORDING_BUFFER} out of range (0-10)")
+
+    if ENGINE == "whisper":
+        if WHISPER_MODEL not in VALID_WHISPER_MODELS:
+            errors.append(f"WHISPER_MODEL='{WHISPER_MODEL}' not recognized. Valid: {sorted(VALID_WHISPER_MODELS)}")
+
+        if DEVICE not in VALID_DEVICES:
+            errors.append(f"DEVICE='{DEVICE}' invalid. Valid: {sorted(VALID_DEVICES)}")
+
+        if COMPUTE_TYPE not in VALID_COMPUTE_TYPES:
+            errors.append(f"COMPUTE_TYPE='{COMPUTE_TYPE}' invalid. Valid: {sorted(VALID_COMPUTE_TYPES)}")
+
+    if IDLE_TIMEOUT < 0:
+        errors.append(f"IDLE_TIMEOUT={IDLE_TIMEOUT} must be >= 0")
+
+    if MAX_RECORDING_DURATION < 0:
+        errors.append(f"MAX_RECORDING_DURATION={MAX_RECORDING_DURATION} must be >= 0")
+
+    if errors:
+        for err in errors:
+            logger.error(f"Config error: {err}")
+            print(f"❌ Config error: {err}", file=sys.stderr)
+        sys.exit(1)
+
+    logger.info("Config validation passed")
 
 def send_notification(message: str) -> None:
     """Send desktop notification that replaces previous ones."""
@@ -335,6 +384,8 @@ class AudioRecorderDaemon:
         self.is_recording = False
 
         if self.process:
+            # Brief delay to capture trailing speech before terminating
+            time.sleep(0.3)
             logger.info(f"Terminating parecord process {self.process.pid}")
             self.process.terminate()
             try:
@@ -424,12 +475,28 @@ class TranscriptionPipeline:
     """Handles transcription and polishing pipeline."""
 
     def __init__(self):
-        logger.info(f"Initializing TranscriptionPipeline (model={WHISPER_MODEL}, device={DEVICE}, polishing={ENABLE_POLISHING})")
-        # Removed loading notification - loads in background silently
+        logger.info(f"Initializing TranscriptionPipeline (engine={ENGINE}, model={WHISPER_MODEL}, device={DEVICE}, polishing={ENABLE_POLISHING})")
+        self.engine = ENGINE
 
-        logger.info("Loading Whisper model...")
-        self.whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
-        logger.info("Whisper model loaded successfully")
+        if self.engine == "parakeet":
+            logger.info("Loading Parakeet TDT model via onnx-asr...")
+            import onnx_asr
+            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2")
+            logger.info("Parakeet model loaded successfully")
+        else:
+            from faster_whisper import WhisperModel
+            logger.info("Loading Whisper model...")
+            try:
+                self.whisper = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
+            except Exception as e:
+                if DEVICE != "cpu":
+                    logger.warning(f"Failed to load model on {DEVICE}: {e}")
+                    logger.warning("Falling back to CPU with int8 compute type")
+                    send_notification(f"⚠️ {DEVICE} failed, falling back to CPU")
+                    self.whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                else:
+                    raise
+            logger.info("Whisper model loaded successfully")
 
         if ENABLE_POLISHING:
             logger.info("Initializing OpenAI client...")
@@ -444,16 +511,20 @@ class TranscriptionPipeline:
         logger.info(f"Processing audio file: {audio_path}")
 
         # Transcribe (no notification - happens fast)
-        logger.info("Starting Whisper transcription...")
+        logger.info(f"Starting transcription (engine={self.engine})...")
 
         try:
-            segments, _ = self.whisper.transcribe(
-                audio_path,
-                beam_size=5,
-                vad_filter=False,  # Disabled - process entire audio without cutting
-            )
-            raw_text = " ".join([seg.text.strip() for seg in segments])
-            logger.info(f"Transcription complete. Raw text: '{raw_text}'")
+            if self.engine == "parakeet":
+                raw_text = self.model.recognize(audio_path)
+                logger.info(f"Transcription complete. Raw text: '{raw_text}'")
+            else:
+                segments, _ = self.whisper.transcribe(
+                    audio_path,
+                    beam_size=5,
+                    vad_filter=False,  # Disabled - process entire audio without cutting
+                )
+                raw_text = " ".join([seg.text.strip() for seg in segments])
+                logger.info(f"Transcription complete. Raw text: '{raw_text}'")
         except ValueError as e:
             # Empty audio or no detectable language
             logger.warning(f"ValueError during transcription: {e}")
@@ -656,7 +727,7 @@ def main():
     """Run daemon in toggle mode (for hotkey integration)."""
     logger.info("=== Daemon started ===")
     logger.info(f"PID: {os.getpid()}")
-    logger.info(f"Config: ENABLE_POLISHING={ENABLE_POLISHING}, AUTO_PASTE={AUTO_PASTE}, MODEL={WHISPER_MODEL}")
+    logger.info(f"Config: ENGINE={ENGINE}, ENABLE_POLISHING={ENABLE_POLISHING}, AUTO_PASTE={AUTO_PASTE}, MODEL={WHISPER_MODEL}")
 
     if ENABLE_POLISHING and not os.getenv("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY not set but polishing is enabled")
@@ -737,7 +808,7 @@ def main():
 
     # Start persistent daemon (slow: loads Whisper model)
     logger.info("Starting persistent daemon (will stay alive for 10 minutes after last use)")
-    logger.info("Loading Whisper model... (this may take a few seconds on first start)")
+    logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
     daemon.last_activity_time = time.time()
     
