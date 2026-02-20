@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import subprocess
+import ctypes
 import threading
 import signal
 import logging
@@ -135,6 +136,24 @@ def play_sound(sound_file: str) -> None:
         )
     except FileNotFoundError:
         pass  # paplay not installed
+
+
+def is_shift_held() -> bool:
+    """Check if Shift is currently pressed via X11 XQueryKeymap."""
+    try:
+        x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+        display = x11.XOpenDisplay(None)
+        if not display:
+            return False
+        keymap = (ctypes.c_char * 32)()
+        x11.XQueryKeymap(display, keymap)
+        x11.XCloseDisplay(display)
+        # Shift_L = keycode 50, Shift_R = keycode 62
+        sl = ord(keymap[50 // 8]) & (1 << (50 % 8))
+        sr = ord(keymap[62 // 8]) & (1 << (62 % 8))
+        return bool(sl or sr)
+    except Exception:
+        return False
 
 
 # Detect session type for clipboard/typing
@@ -609,6 +628,17 @@ class TranscriptionPipeline:
                     stderr=subprocess.DEVNULL
                 )
                 logger.info(f"xdotool type exit code: {result.returncode}")
+            # If Shift is held during paste, press Enter to submit
+            if is_shift_held():
+                logger.info("Shift held during paste, pressing Enter to submit")
+                time.sleep(0.1)
+                if SESSION_TYPE == "wayland":
+                    subprocess.run(['ydotool', 'key', '28:1', '28:0'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             play_sound(SOUND_PASTE)
             send_notification(f"Pasted: {final_text[:50]}...")
         else:
