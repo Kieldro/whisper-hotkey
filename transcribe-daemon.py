@@ -56,6 +56,7 @@ CHUNK_SIZE = 1024
 SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 SOUND_STOP = os.getenv("SOUND_STOP", "/usr/share/sounds/freedesktop/stereo/complete.oga")
 SOUND_LOADING = os.getenv("SOUND_LOADING", "/usr/share/sounds/ubuntu/ringtones/Wind chime.ogg")
+SOUND_PASTE = os.getenv("SOUND_PASTE", "/usr/share/sounds/ubuntu/notifications/Positive.ogg")
 
 # Shared notification ID for replacing notifications
 NOTIFICATION_ID = 999999
@@ -431,9 +432,6 @@ class AudioRecorderDaemon:
         else:
             logger.error(f"Audio file not found: {self.output_file}")
 
-        # Play stop sound
-        play_sound(SOUND_STOP)
-        # Removed "Recording stopped" notification - goes straight to transcribing
         return self.output_file
 
     def _merge_audio_files(self, file1: str, file2: str) -> Optional[str]:
@@ -592,13 +590,13 @@ class TranscriptionPipeline:
             )
         logger.info("Copied to clipboard")
 
-        # Auto-paste if enabled
+        # Auto-paste if enabled (simulate Ctrl+V for instant paste)
         if AUTO_PASTE:
             time.sleep(0.2)  # Brief delay
             if SESSION_TYPE == "wayland":
                 logger.info("Auto-pasting with ydotool type...")
                 result = subprocess.run(
-                    ['ydotool', 'type', final_text],
+                    ['ydotool', 'type', '--next-delay', '0', final_text],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
@@ -606,15 +604,17 @@ class TranscriptionPipeline:
             else:  # X11
                 logger.info("Auto-pasting with xdotool type...")
                 result = subprocess.run(
-                    ['xdotool', 'type', '--clearmodifiers', final_text],
+                    ['xdotool', 'type', '--clearmodifiers', '--delay', '0', final_text],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
                 logger.info(f"xdotool type exit code: {result.returncode}")
-            send_notification(f"✅ Pasted: {final_text[:50]}...")
+            play_sound(SOUND_PASTE)
+            send_notification(f"Pasted: {final_text[:50]}...")
         else:
             logger.info("Auto-paste disabled")
-            send_notification(f"✅ Copied: {final_text[:50]}...")
+            play_sound(SOUND_PASTE)
+            send_notification(f"Copied: {final_text[:50]}...")
 
         logger.info("Processing complete")
         return final_text
