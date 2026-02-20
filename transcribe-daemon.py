@@ -55,6 +55,7 @@ CHUNK_SIZE = 1024
 # Sound file paths (optional - will skip if not found)
 SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 SOUND_STOP = os.getenv("SOUND_STOP", "/usr/share/sounds/freedesktop/stereo/complete.oga")
+SOUND_LOADING = os.getenv("SOUND_LOADING", "/usr/share/sounds/ubuntu/ringtones/Wind chime.ogg")
 
 # Shared notification ID for replacing notifications
 NOTIFICATION_ID = 999999
@@ -384,17 +385,25 @@ class AudioRecorderDaemon:
         self.is_recording = False
 
         if self.process:
-            # Brief delay to capture trailing speech before terminating
-            time.sleep(0.3)
-            logger.info(f"Terminating parecord process {self.process.pid}")
-            self.process.terminate()
+            # Delay to capture trailing speech after key release
+            time.sleep(1.2)
+            logger.info(f"Stopping parecord process {self.process.pid}")
+            # SIGINT triggers clean shutdown so parecord flushes its write buffer
+            # and finalizes the WAV header. SIGTERM can kill it before flushing,
+            # producing empty/truncated files.
+            self.process.send_signal(signal.SIGINT)
             try:
-                self.process.wait(timeout=2)
+                self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                logger.warning("parecord didn't terminate, killing...")
-                self.process.kill()
-                self.process.wait()
-            logger.info("parecord terminated")
+                logger.warning("parecord didn't stop on SIGINT, sending SIGTERM...")
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    logger.warning("parecord didn't terminate, killing...")
+                    self.process.kill()
+                    self.process.wait()
+            logger.info("parecord stopped")
             self.process = None
 
         # Merge pre-buffered audio with new recording if needed
@@ -806,14 +815,41 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
     logger.info("Signal handlers registered")
 
-    # Start persistent daemon (slow: loads Whisper model)
-    logger.info("Starting persistent daemon (will stay alive for 10 minutes after last use)")
+    # Start persistent daemon (slow: loads model)
+    # Create state file immediately so extra presses during load send STOP (not START)
+    Path(state_file).touch()
+
+    # Play calming sound while model loads
+    loading_sound_proc = None
+    if SOUND_LOADING and os.path.exists(SOUND_LOADING):
+        try:
+            loading_sound_proc = subprocess.Popen(
+                ['paplay', SOUND_LOADING],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        except FileNotFoundError:
+            pass
+
     logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
     daemon.last_activity_time = time.time()
-    
-    # Ready and waiting for hotkey
-    logger.info("Daemon ready, waiting for hotkey...")
+
+    # Stop loading sound
+    if loading_sound_proc:
+        loading_sound_proc.terminate()
+        loading_sound_proc = None
+
+    # Clear any signals the user sent while the model was loading (impatient extra presses)
+    start_recording_event.clear()
+    stop_recording_event.clear()
+    # Re-create state file in case a press during loading deleted it
+    Path(state_file).touch()
+
+    # Auto-start recording on first launch (the user pressed the hotkey to get here)
+    logger.info("Daemon ready, auto-starting first recording...")
+    daemon.start_recording()
+    daemon.last_activity_time = time.time()
 
     try:
         logger.info("Daemon loop started, model loaded and ready")
