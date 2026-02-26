@@ -101,9 +101,6 @@ def validate_config() -> None:
     if IDLE_TIMEOUT < 0:
         errors.append(f"IDLE_TIMEOUT={IDLE_TIMEOUT} must be >= 0")
 
-    if MAX_RECORDING_DURATION < 0:
-        errors.append(f"MAX_RECORDING_DURATION={MAX_RECORDING_DURATION} must be >= 0")
-
     if errors:
         for err in errors:
             logger.error(f"Config error: {err}")
@@ -609,7 +606,7 @@ class TranscriptionPipeline:
             )
         logger.info("Copied to clipboard")
 
-        # Auto-paste if enabled (simulate Ctrl+V for instant paste)
+        # Auto-paste if enabled (instant type with zero delay)
         if AUTO_PASTE:
             time.sleep(0.2)  # Brief delay
             if SESSION_TYPE == "wayland":
@@ -767,6 +764,8 @@ def main():
     logger.info("=== Daemon started ===")
     logger.info(f"PID: {os.getpid()}")
     logger.info(f"Config: ENGINE={ENGINE}, ENABLE_POLISHING={ENABLE_POLISHING}, AUTO_PASTE={AUTO_PASTE}, MODEL={WHISPER_MODEL}")
+
+    validate_config()
 
     if ENABLE_POLISHING and not os.getenv("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY not set but polishing is enabled")
