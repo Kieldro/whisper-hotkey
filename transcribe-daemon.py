@@ -28,10 +28,10 @@ import time
 # Load environment variables
 load_dotenv()
 
-# Setup logging
-LOG_FILE = "/tmp/whisper-hotkey.log"
+# Setup logging - use user-private log file
+LOG_FILE = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey.log")
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE),
@@ -48,8 +48,16 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))  # seconds
-PRE_RECORDING_BUFFER = int(os.getenv("PRE_RECORDING_BUFFER", "2"))  # seconds
+try:
+    IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))
+except ValueError:
+    print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
+    sys.exit(1)
+try:
+    PRE_RECORDING_BUFFER = int(os.getenv("PRE_RECORDING_BUFFER", "2"))
+except ValueError:
+    print(f"Error: PRE_RECORDING_BUFFER='{os.getenv('PRE_RECORDING_BUFFER')}' is not a valid integer", file=sys.stderr)
+    sys.exit(1)
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 1024
 
@@ -539,7 +547,7 @@ class TranscriptionPipeline:
         try:
             if self.engine == "parakeet":
                 raw_text = self.model.recognize(audio_path)
-                logger.info(f"Transcription complete. Raw text: '{raw_text}'")
+                logger.info(f"Transcription complete ({len(raw_text)} chars)")
             else:
                 segments, _ = self.whisper.transcribe(
                     audio_path,
@@ -547,7 +555,7 @@ class TranscriptionPipeline:
                     vad_filter=False,  # Disabled - process entire audio without cutting
                 )
                 raw_text = " ".join([seg.text.strip() for seg in segments])
-                logger.info(f"Transcription complete. Raw text: '{raw_text}'")
+                logger.info(f"Transcription complete ({len(raw_text)} chars)")
         except ValueError as e:
             # Empty audio or no detectable language
             logger.warning(f"ValueError during transcription: {e}")
@@ -580,7 +588,7 @@ class TranscriptionPipeline:
                     temperature=0.3
                 )
                 final_text = response.choices[0].message.content.strip()
-                logger.info(f"Polished text: '{final_text}'")
+                logger.info(f"Polished text ({len(final_text)} chars)")
             except Exception as e:
                 logger.error(f"GPT polishing error: {e}", exc_info=True)
                 final_text = raw_text
@@ -590,51 +598,59 @@ class TranscriptionPipeline:
 
         # Copy to clipboard
         logger.info("Copying to clipboard...")
-        if SESSION_TYPE == "wayland":
-            subprocess.run(
-                ['wl-copy'],
-                input=final_text.encode(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        else:  # X11
-            subprocess.run(
-                ['xclip', '-selection', 'clipboard'],
-                input=final_text.encode(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        logger.info("Copied to clipboard")
+        try:
+            if SESSION_TYPE == "wayland":
+                subprocess.run(
+                    ['wl-copy'],
+                    input=final_text.encode(),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            else:  # X11
+                subprocess.run(
+                    ['xclip', '-selection', 'clipboard'],
+                    input=final_text.encode(),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            logger.info("Copied to clipboard")
+        except FileNotFoundError as e:
+            logger.error(f"Clipboard tool not found: {e}")
+            send_notification("Clipboard tool missing")
 
         # Auto-paste if enabled (instant type with zero delay)
         if AUTO_PASTE:
             time.sleep(0.2)  # Brief delay
-            if SESSION_TYPE == "wayland":
-                logger.info("Auto-pasting with ydotool type...")
-                result = subprocess.run(
-                    ['ydotool', 'type', '--next-delay', '0', final_text],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                logger.info(f"ydotool type exit code: {result.returncode}")
-            else:  # X11
-                logger.info("Auto-pasting with xdotool type...")
-                result = subprocess.run(
-                    ['xdotool', 'type', '--clearmodifiers', '--delay', '0', final_text],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                logger.info(f"xdotool type exit code: {result.returncode}")
-            # If Shift is held during paste, press Enter to submit
-            if is_shift_held():
-                logger.info("Shift held during paste, pressing Enter to submit")
-                time.sleep(0.1)
+            try:
                 if SESSION_TYPE == "wayland":
-                    subprocess.run(['ydotool', 'key', '28:1', '28:0'],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                else:
-                    subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    logger.info("Auto-pasting with ydotool type...")
+                    result = subprocess.run(
+                        ['ydotool', 'type', '--next-delay', '0', final_text],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    logger.info(f"ydotool type exit code: {result.returncode}")
+                else:  # X11
+                    logger.info("Auto-pasting with xdotool type...")
+                    result = subprocess.run(
+                        ['xdotool', 'type', '--clearmodifiers', '--delay', '0', final_text],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    logger.info(f"xdotool type exit code: {result.returncode}")
+                # If Shift is held during paste, press Enter to submit
+                if is_shift_held():
+                    logger.info("Shift held during paste, pressing Enter to submit")
+                    time.sleep(0.1)
+                    if SESSION_TYPE == "wayland":
+                        subprocess.run(['ydotool', 'key', '28:1', '28:0'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError as e:
+                logger.error(f"Paste tool not found: {e}")
+                send_notification("Paste tool missing (text copied to clipboard)")
 
             play_sound(SOUND_PASTE)
             send_notification(f"Pasted: {final_text[:50]}...")
