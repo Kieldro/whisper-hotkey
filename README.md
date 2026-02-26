@@ -25,6 +25,17 @@ Transcription takes ~0.3-0.6s after you stop recording. The model stays loaded i
 
 ## Quick Start
 
+```bash
+git clone https://github.com/Kieldro/whisper-hotkey.git
+cd whisper-hotkey
+./install.sh
+```
+
+The installer handles system deps, Python environment, engine selection, GPU detection, hotkey setup, and model download.
+
+<details>
+<summary>Manual installation</summary>
+
 ### 1. Install dependencies
 
 ```bash
@@ -47,6 +58,8 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+</details>
 
 ### 3. Set up your hotkey
 
