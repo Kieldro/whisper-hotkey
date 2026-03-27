@@ -35,7 +35,7 @@ echo ""
 # --- Install system dependencies ---
 echo "Installing system dependencies..."
 
-COMMON_DEPS_APT="python3-venv python3-pip portaudio19-dev pulseaudio-utils libnotify-bin"
+COMMON_DEPS_APT="python3-venv python3-pip pulseaudio-utils libnotify-bin"
 COMMON_DEPS_PACMAN="python python-pip portaudio libnotify"
 COMMON_DEPS_DNF="python3-virtualenv portaudio-devel libnotify"
 
@@ -102,7 +102,7 @@ if [ "$ENGINE_CHOICE" = "2" ]; then
 else
     ENGINE="parakeet"
     echo "Installing Parakeet TDT..."
-    pip install -q "onnx-asr[hub]" "onnxruntime<1.21" openai python-dotenv pyaudio
+    pip install -q "onnx-asr[hub]" "onnxruntime<1.21" openai python-dotenv
 fi
 
 echo ""
@@ -137,7 +137,7 @@ bash "$PROJECT_DIR/scripts/setup-hotkey.sh"
 echo ""
 echo "Downloading model (this may take a minute)..."
 if [ "$ENGINE" = "parakeet" ]; then
-    "$VENV_DIR/bin/python" -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v2'); print('Model downloaded')"
+    "$VENV_DIR/bin/python" -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v3'); print('Model downloaded')"
 else
     "$VENV_DIR/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small'); print('Model downloaded')"
 fi

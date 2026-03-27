@@ -12,12 +12,8 @@ import ctypes
 import threading
 import signal
 import logging
-import wave
-import pyaudio
 import fcntl
 import shutil
-from collections import deque
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -53,17 +49,10 @@ try:
 except ValueError:
     print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
     sys.exit(1)
-try:
-    PRE_RECORDING_BUFFER = int(os.getenv("PRE_RECORDING_BUFFER", "2"))
-except ValueError:
-    print(f"Error: PRE_RECORDING_BUFFER='{os.getenv('PRE_RECORDING_BUFFER')}' is not a valid integer", file=sys.stderr)
-    sys.exit(1)
 SAMPLE_RATE = 16000
-CHUNK_SIZE = 1024
 
 # Sound file paths (optional - will skip if not found)
 SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
-SOUND_STOP = os.getenv("SOUND_STOP", "/usr/share/sounds/freedesktop/stereo/complete.oga")
 SOUND_LOADING = os.getenv("SOUND_LOADING", "/usr/share/sounds/ubuntu/ringtones/Wind chime.ogg")
 SOUND_PASTE = os.getenv("SOUND_PASTE", "/usr/share/sounds/ubuntu/notifications/Positive.ogg")
 
@@ -92,9 +81,6 @@ def validate_config() -> None:
 
     if ENGINE not in VALID_ENGINES:
         errors.append(f"ENGINE='{ENGINE}' invalid. Valid: {sorted(VALID_ENGINES)}")
-
-    if not (0 <= PRE_RECORDING_BUFFER <= 10):
-        errors.append(f"PRE_RECORDING_BUFFER={PRE_RECORDING_BUFFER} out of range (0-10)")
 
     if ENGINE == "whisper":
         if WHISPER_MODEL not in VALID_WHISPER_MODELS:
@@ -198,148 +184,20 @@ SESSION_TYPE = detect_session_type()
 logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
 
 
-class PreRecordingBuffer:
-    """Continuously buffers audio in memory to capture pre-hotkey speech."""
-
-    def __init__(self, duration: int = PRE_RECORDING_BUFFER, sample_rate: int = SAMPLE_RATE, chunk_size: int = CHUNK_SIZE):
-        self.duration = duration
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.enabled = duration > 0
-
-        if not self.enabled:
-            logger.info("Pre-recording buffer disabled (duration = 0)")
-            return
-
-        # Calculate buffer size (number of chunks to keep)
-        chunks_per_second = sample_rate / chunk_size
-        self.max_chunks = int(chunks_per_second * duration)
-
-        # Circular buffer for audio chunks
-        self.buffer = deque(maxlen=self.max_chunks)
-        self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self.thread: Optional[threading.Thread] = None
-        self.audio = None
-        self.stream = None
-
-        logger.info(f"Pre-recording buffer initialized: {duration}s ({self.max_chunks} chunks)")
-
-    def start(self) -> None:
-        """Start continuous background recording."""
-        if not self.enabled or self.thread is not None:
-            return
-
-        try:
-            self.audio = pyaudio.PyAudio()
-            # Use smaller buffer and shorter timeout for responsive shutdown
-            self.stream = self.audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.sample_rate,
-                input=True,
-                frames_per_buffer=self.chunk_size
-            )
-            self._stop_event.clear()
-            self.thread = threading.Thread(target=self._record_loop, daemon=True)
-            self.thread.start()
-            logger.info("Pre-recording buffer started")
-        except Exception as e:
-            logger.error(f"Failed to start pre-recording buffer: {e}")
-            self.enabled = False
-
-    def _record_loop(self) -> None:
-        """Continuously record audio into circular buffer."""
-        while not self._stop_event.is_set():
-            try:
-                # Check if stream is still valid
-                if self.stream is None or not self.stream.is_active():
-                    break
-                data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                with self._lock:
-                    self.buffer.append(data)
-            except OSError:
-                # Stream was closed
-                break
-            except Exception as e:
-                logger.error(f"Error in pre-recording buffer: {e}")
-                break
-
-    def get_buffered_audio(self) -> bytes:
-        """Get all buffered audio as bytes."""
-        if not self.enabled:
-            return b''
-        with self._lock:
-            if not self.buffer:
-                return b''
-            return b''.join(self.buffer)
-
-    def stop(self) -> None:
-        """Stop the buffer and cleanup resources."""
-        if not self.enabled:
-            return
-
-        # Signal thread to stop
-        self._stop_event.set()
-
-        # Close stream first to unblock the read() call
-        if self.stream:
-            try:
-                self.stream.stop_stream()
-                self.stream.close()
-            except Exception:
-                pass
-            self.stream = None
-
-        # Now join the thread (should exit quickly since stream is closed)
-        if self.thread:
-            self.thread.join(timeout=2.0)
-            self.thread = None
-
-        if self.audio:
-            try:
-                self.audio.terminate()
-            except Exception:
-                pass
-            self.audio = None
-
-        logger.info("Pre-recording buffer stopped")
-
-
 class AudioRecorderDaemon:
     """Non-blocking audio recorder using parecord."""
 
-    def __init__(self, sample_rate: int = SAMPLE_RATE, pre_buffer: Optional['PreRecordingBuffer'] = None):
+    def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
         self.is_recording = False
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
-        self.pre_buffer = pre_buffer
-        self.pre_buffer_file: Optional[str] = None
 
     def start_recording(self) -> bool:
         """Start recording with parecord. Returns True on success."""
         if self.is_recording:
             logger.warning("Already recording, ignoring start request")
             return False
-
-        # Save pre-buffered audio if available
-        self.pre_buffer_file = None
-        if self.pre_buffer and self.pre_buffer.enabled:
-            buffered_audio = self.pre_buffer.get_buffered_audio()
-            if buffered_audio:
-                # Write buffered audio to temp WAV file
-                temp_buffer = tempfile.NamedTemporaryFile(suffix='_buffer.wav', delete=False)
-                self.pre_buffer_file = temp_buffer.name
-                temp_buffer.close()
-
-                with wave.open(self.pre_buffer_file, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)  # 16-bit = 2 bytes
-                    wf.setframerate(self.sample_rate)
-                    wf.writeframes(buffered_audio)
-
-                logger.info(f"Saved {len(buffered_audio)} bytes of pre-buffered audio to {self.pre_buffer_file}")
 
         # Create temp file for new recording
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
@@ -387,12 +245,6 @@ class AudioRecorderDaemon:
 
     def _cleanup_temp_files(self) -> None:
         """Clean up any temp files created during recording."""
-        if self.pre_buffer_file and os.path.exists(self.pre_buffer_file):
-            try:
-                os.unlink(self.pre_buffer_file)
-            except OSError:
-                pass
-            self.pre_buffer_file = None
         if self.output_file and os.path.exists(self.output_file):
             try:
                 os.unlink(self.output_file)
@@ -431,24 +283,6 @@ class AudioRecorderDaemon:
             logger.info("parecord stopped")
             self.process = None
 
-        # Merge pre-buffered audio with new recording if needed
-        if self.pre_buffer_file and os.path.exists(self.pre_buffer_file):
-            logger.info("Merging pre-buffered audio with recording...")
-            merged_file = self._merge_audio_files(self.pre_buffer_file, self.output_file)
-            if merged_file:
-                # Clean up temp files
-                try:
-                    os.unlink(self.pre_buffer_file)
-                except OSError:
-                    pass
-                try:
-                    os.unlink(self.output_file)
-                except OSError:
-                    pass
-                self.output_file = merged_file
-                logger.info(f"Merged audio file: {merged_file}")
-            self.pre_buffer_file = None
-
         # Check file size
         if self.output_file and os.path.exists(self.output_file):
             file_size = os.path.getsize(self.output_file)
@@ -457,44 +291,6 @@ class AudioRecorderDaemon:
             logger.error(f"Audio file not found: {self.output_file}")
 
         return self.output_file
-
-    def _merge_audio_files(self, file1: str, file2: str) -> Optional[str]:
-        """Merge two WAV files into one."""
-        merged_file = None
-        try:
-            # Read first file
-            with wave.open(file1, 'rb') as wf1:
-                params1 = wf1.getparams()
-                frames1 = wf1.readframes(wf1.getnframes())
-
-            # Read second file
-            with wave.open(file2, 'rb') as wf2:
-                params2 = wf2.getparams()
-                frames2 = wf2.readframes(wf2.getnframes())
-
-            # Verify compatibility
-            if params1[:3] != params2[:3]:  # channels, sampwidth, framerate
-                logger.error("Audio files have incompatible parameters")
-                return None
-
-            # Write merged file
-            merged_file = tempfile.NamedTemporaryFile(suffix='_merged.wav', delete=False).name
-            with wave.open(merged_file, 'wb') as wf_out:
-                wf_out.setparams(params1)
-                wf_out.writeframes(frames1 + frames2)
-
-            logger.info(f"Successfully merged audio files: {len(frames1)} + {len(frames2)} bytes")
-            return merged_file
-
-        except Exception as e:
-            logger.error(f"Failed to merge audio files: {e}")
-            # Clean up partial merged file on failure
-            if merged_file and os.path.exists(merged_file):
-                try:
-                    os.unlink(merged_file)
-                except OSError:
-                    pass
-            return None
 
     def cleanup(self) -> None:
         """Cleanup audio resources."""
@@ -512,7 +308,7 @@ class TranscriptionPipeline:
         if self.engine == "parakeet":
             logger.info("Loading Parakeet TDT model via onnx-asr...")
             import onnx_asr
-            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v2")
+            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3")
             logger.info("Parakeet model loaded successfully")
         else:
             from faster_whisper import WhisperModel
@@ -587,7 +383,8 @@ class TranscriptionPipeline:
                     ],
                     temperature=0.3
                 )
-                final_text = response.choices[0].message.content.strip()
+                content = response.choices[0].message.content
+                final_text = content.strip() if content else raw_text
                 logger.info(f"Polished text ({len(final_text)} chars)")
             except Exception as e:
                 logger.error(f"GPT polishing error: {e}", exc_info=True)
@@ -623,13 +420,13 @@ class TranscriptionPipeline:
             time.sleep(0.2)  # Brief delay
             try:
                 if SESSION_TYPE == "wayland":
-                    logger.info("Auto-pasting with ydotool type...")
+                    logger.info("Auto-pasting with ydotool Ctrl+V...")
                     result = subprocess.run(
-                        ['ydotool', 'type', '--next-delay', '0', final_text],
+                        ['ydotool', 'key', '29:1', '47:1', '47:0', '29:0'],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
-                    logger.info(f"ydotool type exit code: {result.returncode}")
+                    logger.info(f"ydotool key exit code: {result.returncode}")
                 else:  # X11
                     logger.info("Auto-pasting with xdotool type...")
                     result = subprocess.run(
@@ -667,30 +464,12 @@ class TranscriptionDaemon:
     """Background daemon handling recording and transcription."""
 
     def __init__(self):
-        # Initialize pre-recording buffer
-        self.pre_buffer = PreRecordingBuffer()
-        self.pre_buffer.start()
-
-        self.recorder = AudioRecorderDaemon(pre_buffer=self.pre_buffer)
+        self.recorder = AudioRecorderDaemon()
         self.pipeline = TranscriptionPipeline()
         self._audio_lock = threading.Lock()
         self._current_audio_file: Optional[str] = None
         self.last_activity_time = time.time()
         self.idle_timeout = IDLE_TIMEOUT
-
-    def toggle_recording(self) -> None:
-        """Toggle recording state (for push-to-talk)."""
-        if not self.recorder.is_recording:
-            # Start recording
-            self.recorder.start_recording()
-        else:
-            # Stop recording and process
-            audio_path = self.recorder.stop_recording()
-            if audio_path:
-                with self._audio_lock:
-                    self._current_audio_file = audio_path
-                # Process in background thread
-                threading.Thread(target=self._process_audio, daemon=True).start()
 
     def _process_audio(self) -> None:
         """Process recorded audio in background."""
@@ -741,8 +520,6 @@ class TranscriptionDaemon:
     def cleanup(self) -> None:
         """Cleanup resources."""
         self.recorder.cleanup()
-        if self.pre_buffer:
-            self.pre_buffer.stop()
 
 
 def acquire_daemon_lock(lock_file: str) -> Optional[int]:
@@ -751,7 +528,7 @@ def acquire_daemon_lock(lock_file: str) -> Optional[int]:
     Returns file descriptor on success, None if another daemon holds the lock.
     """
     try:
-        fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # We got the lock - write our PID
@@ -788,8 +565,8 @@ def main():
         print("❌ Error: OPENAI_API_KEY not set (required when ENABLE_POLISHING=true)", file=sys.stderr)
         sys.exit(1)
 
-    state_file = "/tmp/whisper-hotkey-state"
-    daemon_lock_file = "/tmp/whisper-hotkey-daemon.lock"
+    state_file = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-state")
+    daemon_lock_file = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-daemon.lock")
 
     # Try to acquire the daemon lock
     lock_fd = acquire_daemon_lock(daemon_lock_file)

@@ -2,7 +2,7 @@
 
 Push-to-talk voice transcription for Linux. Press a hotkey, speak, press again — your words appear instantly as text wherever your cursor is.
 
-Runs 100% locally with [Parakeet TDT](https://github.com/NVIDIA/NeMo) or [faster-whisper](https://github.com/guillaumekln/faster-whisper). No cloud, no subscription, no data leaves your machine.
+Runs 100% locally with [Parakeet TDT v3](https://github.com/NVIDIA/NeMo) (25 languages) or [faster-whisper](https://github.com/guillaumekln/faster-whisper). No cloud, no subscription, no data leaves your machine.
 
 ## How It Works
 
@@ -18,7 +18,7 @@ Transcription takes ~0.3-0.6s after you stop recording. The model stays loaded i
 - **Fast local transcription** — Parakeet TDT (~0.3s) or faster-whisper (~0.5s) on GPU
 - **Auto-paste** — text appears wherever your cursor is, no manual pasting
 - **Push-to-talk daemon** — background process with audio feedback (start chime, wind chime during model load, completion sound after paste)
-- **Pre-recording buffer** — captures up to 2s of audio before you press the hotkey, so your first words aren't lost
+- **Shift-to-submit** — hold Shift during paste to press Enter (great for chat apps)
 - **Optional GPT polishing** — clean up grammar/formatting via OpenAI API
 - **Works offline** — no internet required in default mode
 - **X11 and Wayland** — auto-detects your session type
@@ -40,11 +40,11 @@ The installer handles system deps, Python environment, engine selection, GPU det
 
 ```bash
 # Ubuntu/Debian (X11)
-sudo apt install python3-venv python3-pip portaudio19-dev pulseaudio-utils \
+sudo apt install python3-venv python3-pip pulseaudio-utils \
   xclip xdotool libnotify-bin
 
 # Ubuntu/Debian (Wayland)
-sudo apt install python3-venv python3-pip portaudio19-dev pulseaudio-utils \
+sudo apt install python3-venv python3-pip pulseaudio-utils \
   wl-clipboard ydotool libnotify-bin
 # sudo systemctl enable --now ydotool
 ```
@@ -91,7 +91,6 @@ Copy `.env.example` to `.env` and edit as needed:
 | `DEVICE` | `cpu` | `cpu` or `cuda` for GPU acceleration |
 | `COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (GPU) |
 | `AUTO_PASTE` | `true` | Paste transcription into active window |
-| `PRE_RECORDING_BUFFER` | `2` | Seconds of audio to capture before hotkey (0 = off) |
 | `ENABLE_POLISHING` | `false` | GPT grammar/formatting cleanup |
 | `OPENAI_API_KEY` | — | Required only if polishing is enabled |
 | `IDLE_TIMEOUT` | `600` | Seconds before daemon unloads model (0 = never) |
@@ -130,7 +129,7 @@ The daemon (`transcribe-daemon.py`) loads the model once and stays resident for 
 
 **Not pasting** — make sure `xdotool` (X11) or `ydotool` (Wayland) is installed and working.
 
-**Model download fails** — models download on first run. Run `python3 -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v2')"` manually to debug.
+**Model download fails** — models download on first run. Run `python3 -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v3')"` manually to debug.
 
 **Check logs** — `tail -f /tmp/whisper-hotkey.log`
 

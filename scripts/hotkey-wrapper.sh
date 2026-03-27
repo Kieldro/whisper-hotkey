@@ -3,7 +3,7 @@
 # Press once to start recording, press again to stop and transcribe
 
 # Logging
-LOG_FILE="/tmp/whisper-hotkey.log"
+LOG_FILE="${XDG_RUNTIME_DIR:-/tmp}/whisper-hotkey.log"
 echo "=== $(date) ===" >> "$LOG_FILE"
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
