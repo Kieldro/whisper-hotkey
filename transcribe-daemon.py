@@ -6,6 +6,10 @@ More Superwhisper-like UX: hold key to record, release to transcribe.
 
 import os
 import sys
+import re
+import json
+import wave
+import struct
 import tempfile
 import subprocess
 import ctypes
@@ -56,6 +60,18 @@ except ValueError:
     print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
     sys.exit(1)
 
+# Feature configs
+ENABLE_VAD = os.getenv("ENABLE_VAD", "true").lower() == "true"
+try:
+    VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
+except ValueError:
+    print(f"Error: VAD_THRESHOLD='{os.getenv('VAD_THRESHOLD')}' is not a valid number", file=sys.stderr)
+    sys.exit(1)
+ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
+ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "true").lower() == "true"
+REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
+PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
+
 # Sound file paths (optional - will skip if not found)
 SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
 SOUND_LOADING = os.getenv("SOUND_LOADING", "/usr/share/sounds/ubuntu/ringtones/Wind chime.ogg")
@@ -63,6 +79,9 @@ SOUND_PASTE = os.getenv("SOUND_PASTE", "/usr/share/sounds/ubuntu/notifications/P
 
 # Shared notification ID for replacing notifications
 NOTIFICATION_ID = 999999
+
+# Status file for waybar/polybar integration
+STATUS_FILE = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-status.json")
 
 # Valid config values for validation
 VALID_WHISPER_MODELS = {
@@ -103,7 +122,7 @@ def validate_config() -> None:
     if errors:
         for err in errors:
             logger.error(f"Config error: {err}")
-            print(f"❌ Config error: {err}", file=sys.stderr)
+            print(f"Config error: {err}", file=sys.stderr)
         sys.exit(1)
 
     logger.info("Config validation passed")
@@ -132,6 +151,33 @@ def play_sound(sound_file: str) -> None:
         )
     except FileNotFoundError:
         pass  # paplay not installed
+
+
+# ---------------------------------------------------------------------------
+# Feature 7: Waybar/Polybar status integration
+# ---------------------------------------------------------------------------
+
+def update_status(state: str, **kwargs) -> None:
+    """Write current daemon state to JSON file for waybar/polybar."""
+    data = {"state": state, "timestamp": time.time()}
+    data.update(kwargs)
+    try:
+        tmp_path = STATUS_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, STATUS_FILE)
+    except OSError as e:
+        logger.debug(f"Failed to write status file: {e}")
+
+
+def cleanup_status() -> None:
+    """Remove status file on daemon shutdown."""
+    try:
+        os.remove(STATUS_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.debug(f"Failed to remove status file: {e}")
 
 
 def is_shift_held() -> bool:
@@ -189,6 +235,398 @@ SESSION_TYPE = detect_session_type()
 logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
 
 
+# ---------------------------------------------------------------------------
+# Feature 1: Silero VAD trimming
+# ---------------------------------------------------------------------------
+
+_vad_model = None
+_vad_utils = None
+
+
+def _get_vad_model():
+    """Lazy-load Silero VAD model once, reuse on subsequent calls."""
+    global _vad_model, _vad_utils
+    if _vad_model is None:
+        import torch
+        model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            trust_repo=True,
+        )
+        _vad_model = model
+        _vad_utils = utils
+        logger.info("Silero VAD model loaded")
+    return _vad_model, _vad_utils
+
+
+def vad_trim_audio(audio_path: str) -> Optional[str]:
+    """Trim leading/trailing silence using Silero VAD. Returns None if no speech."""
+    if not ENABLE_VAD:
+        return audio_path
+
+    try:
+        import torch
+    except ImportError:
+        logger.warning("torch not installed, skipping VAD")
+        return audio_path
+
+    try:
+        model, utils = _get_vad_model()
+        get_speech_timestamps = utils[0]
+
+        with wave.open(audio_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        samples = struct.unpack(f"<{n_frames * n_channels}h", raw)
+        audio_tensor = torch.FloatTensor(samples) / 32768.0
+
+        speech_timestamps = get_speech_timestamps(
+            audio_tensor,
+            model,
+            threshold=VAD_THRESHOLD,
+            sampling_rate=SAMPLE_RATE,
+        )
+
+        if not speech_timestamps:
+            logger.info("VAD: no speech detected, skipping transcription")
+            send_notification("No speech detected")
+            update_status("idle")
+            return None
+
+        # Trim with 0.1s padding
+        pad = int(0.1 * SAMPLE_RATE)
+        start = max(0, speech_timestamps[0]["start"] - pad)
+        end = min(len(samples), speech_timestamps[-1]["end"] + pad)
+
+        trimmed = struct.pack(f"<{end - start}h", *samples[start:end])
+        with wave.open(audio_path, "wb") as wf:
+            wf.setnchannels(n_channels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(framerate)
+            wf.writeframes(trimmed)
+
+        duration_before = len(samples) / SAMPLE_RATE
+        duration_after = (end - start) / SAMPLE_RATE
+        logger.info(
+            "VAD: trimmed %.2fs -> %.2fs (%.0f%% removed)",
+            duration_before,
+            duration_after,
+            (1 - duration_after / duration_before) * 100 if duration_before > 0 else 0,
+        )
+        return audio_path
+
+    except Exception as e:
+        logger.error("VAD trimming failed, using original audio: %s", e)
+        return audio_path
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Audio normalization
+# ---------------------------------------------------------------------------
+
+def normalize_audio(audio_path: str) -> str:
+    """Normalize audio to 80% of max amplitude. Skips if near target."""
+    if not ENABLE_AUDIO_NORMALIZATION:
+        return audio_path
+
+    try:
+        with wave.open(audio_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+
+        n_samples = n_frames * n_channels
+        target = int(32767 * 0.8)
+
+        try:
+            import numpy as np
+
+            samples = np.frombuffer(raw, dtype=np.int16).copy()
+            peak = int(np.max(np.abs(samples)))
+
+            if peak == 0:
+                logger.info("Normalization: silent audio, skipping")
+                return audio_path
+
+            scale = target / peak
+
+            if 0.9 <= scale <= 1.1:
+                logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
+                return audio_path
+
+            normalized = np.clip(samples * scale, -32768, 32767).astype(np.int16)
+            raw_out = normalized.tobytes()
+
+        except ImportError:
+            samples = list(struct.unpack(f"<{n_samples}h", raw))
+            peak = max(abs(s) for s in samples)
+
+            if peak == 0:
+                logger.info("Normalization: silent audio, skipping")
+                return audio_path
+
+            scale = target / peak
+
+            if 0.9 <= scale <= 1.1:
+                logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
+                return audio_path
+
+            normalized = [max(-32768, min(32767, int(s * scale))) for s in samples]
+            raw_out = struct.pack(f"<{n_samples}h", *normalized)
+
+        with wave.open(audio_path, "wb") as wf:
+            wf.setnchannels(n_channels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(framerate)
+            wf.writeframes(raw_out)
+
+        logger.info("Normalization: scale=%.3f, peak %d -> %d", scale, peak, target)
+        return audio_path
+
+    except Exception as e:
+        logger.error("Audio normalization failed, using original: %s", e)
+        return audio_path
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: Spoken punctuation conversion
+# ---------------------------------------------------------------------------
+
+# Multi-word phrases must come before single-word components
+SPOKEN_PUNCTUATION = [
+    ("new paragraph", "\n\n"),
+    ("new line", "\n"),
+    ("exclamation mark", "!"),
+    ("exclamation point", "!"),
+    ("question mark", "?"),
+    ("open paren", "("),
+    ("close paren", ")"),
+    ("semicolon", ";"),
+    ("colon", ":"),
+    ("comma", ","),
+    ("period", "."),
+    ("en dash", "\u2013"),
+    ("em dash", "\u2014"),
+    ("dash", "\u2014"),
+    ("hyphen", "-"),
+    ("open quote", '"'),
+    ("close quote", '"'),
+    ("end quote", '"'),
+    ("quote", '"'),
+]
+
+_SPOKEN_PUNCT_COMPILED = [
+    (re.compile(r"\b" + re.escape(phrase) + r"\b", re.IGNORECASE), replacement)
+    for phrase, replacement in SPOKEN_PUNCTUATION
+]
+
+
+def apply_spoken_punctuation(text: str) -> str:
+    """Convert spoken punctuation words to their symbol equivalents."""
+    if not ENABLE_SPOKEN_PUNCTUATION:
+        return text
+
+    for pattern, replacement in _SPOKEN_PUNCT_COMPILED:
+        text = pattern.sub(replacement, text)
+
+    # Clean up spacing around punctuation
+    text = re.sub(r'\s+([.,!?;:)])', r'\1', text)
+    text = re.sub(r'([(])\s+', r'\1', text)
+    text = re.sub(r'(^|\s)"(\s+)', r'\1"', text)
+    text = re.sub(r'\s+"(\s|$|[.,!?;:)])', r'"\1', text)
+    text = re.sub(r' *\n *', '\n', text)
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: Word replacement dictionary
+# ---------------------------------------------------------------------------
+
+def load_replacements() -> list:
+    """Load word replacement dictionary from JSON file."""
+    try:
+        with open(REPLACEMENTS_FILE, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.debug("Replacements file not found: %s", REPLACEMENTS_FILE)
+        return []
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load replacements file %s: %s", REPLACEMENTS_FILE, e)
+        return []
+
+    if not isinstance(data, dict):
+        logger.warning("Replacements file must contain a JSON object, got %s", type(data).__name__)
+        return []
+
+    result = []
+    for word, replacement in data.items():
+        try:
+            compiled = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
+            result.append((compiled, replacement))
+        except re.error as e:
+            logger.warning("Invalid replacement pattern %r: %s", word, e)
+
+    if result:
+        logger.info(f"Loaded {len(result)} word replacements from {REPLACEMENTS_FILE}")
+    return result
+
+
+_WORD_REPLACEMENTS = load_replacements()
+
+
+def apply_word_replacements(text: str) -> str:
+    """Apply user-defined word replacements from replacements.json."""
+    for pattern, replacement in _WORD_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Clipboard save/restore
+# ---------------------------------------------------------------------------
+
+def save_clipboard() -> Optional[bytes]:
+    """Save current clipboard contents before overwriting."""
+    try:
+        if SESSION_TYPE == "wayland":
+            cmd = ["wl-paste", "--no-newline"]
+        else:
+            cmd = ["xclip", "-selection", "clipboard", "-o"]
+
+        result = subprocess.run(cmd, capture_output=True, timeout=2)
+        if result.returncode != 0 or not result.stdout:
+            return None
+        return result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+        logger.debug(f"Could not save clipboard: {e}")
+        return None
+
+
+def restore_clipboard(content: Optional[bytes]) -> None:
+    """Restore previously saved clipboard contents."""
+    if content is None:
+        return
+
+    try:
+        if SESSION_TYPE == "wayland":
+            cmd = ["wl-copy"]
+        else:
+            cmd = ["xclip", "-selection", "clipboard"]
+
+        subprocess.run(cmd, input=content, timeout=2, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+        logger.debug(f"Could not restore clipboard: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: Paste fallback chain
+# ---------------------------------------------------------------------------
+
+def _build_paste_chain() -> list:
+    """Build ordered list of paste methods based on session type and available tools."""
+    chain = []
+
+    if SESSION_TYPE == "wayland":
+        if shutil.which("wtype"):
+            chain.append("wtype")
+        if shutil.which("ydotool"):
+            chain.append("ydotool-clipboard")
+    else:
+        if shutil.which("xdotool"):
+            chain.append("xdotool-type")
+            chain.append("xdotool-clipboard")
+
+    return chain
+
+
+PASTE_CHAIN = _build_paste_chain()
+logger.info(f"Paste chain: {PASTE_CHAIN}")
+
+
+def _copy_to_clipboard(text: str) -> None:
+    """Copy text to clipboard (helper for clipboard-based paste methods)."""
+    try:
+        if SESSION_TYPE == "wayland":
+            subprocess.run(["wl-copy"], input=text.encode(), timeout=2, check=False)
+        else:
+            subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), timeout=2, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.debug(f"Clipboard copy failed: {e}")
+
+
+def _execute_paste(method: str, text: str) -> bool:
+    """Execute a single paste method. Returns True on success."""
+    if method == "wtype":
+        result = subprocess.run(
+            ["wtype", "--", text],
+            timeout=5, capture_output=True, check=False,
+        )
+        return result.returncode == 0
+
+    elif method == "ydotool-clipboard":
+        _copy_to_clipboard(text)
+        result = subprocess.run(
+            ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+            timeout=5, capture_output=True, check=False,
+        )
+        return result.returncode == 0
+
+    elif method == "xdotool-type":
+        result = subprocess.run(
+            ["xdotool", "type", "--clearmodifiers", "--delay", "0", text],
+            timeout=5, capture_output=True, check=False,
+        )
+        return result.returncode == 0
+
+    elif method == "xdotool-clipboard":
+        _copy_to_clipboard(text)
+        result = subprocess.run(
+            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+            timeout=5, capture_output=True, check=False,
+        )
+        return result.returncode == 0
+
+    else:
+        logger.warning(f"Unknown paste method: {method}")
+        return False
+
+
+def paste_text(text: str) -> tuple:
+    """Paste text using fallback chain. Returns (success, method_used)."""
+    if PASTE_METHOD != "auto":
+        chain = [PASTE_METHOD]
+    else:
+        chain = PASTE_CHAIN
+
+    if not chain:
+        logger.warning(f"No paste methods available for {SESSION_TYPE}")
+        return (False, "")
+
+    for method in chain:
+        try:
+            success = _execute_paste(method, text)
+            if success:
+                logger.info(f"Pasted with method: {method}")
+                return (True, method)
+            logger.debug(f"Paste method {method} failed, trying next")
+        except Exception as e:
+            logger.debug(f"Paste method {method} raised {type(e).__name__}: {e}")
+
+    logger.warning("All paste methods exhausted")
+    return (False, "")
+
+
+# ---------------------------------------------------------------------------
+# Classes
+# ---------------------------------------------------------------------------
+
 class AudioRecorderDaemon:
     """Non-blocking audio recorder using parecord."""
 
@@ -228,24 +666,25 @@ class AudioRecorderDaemon:
             time.sleep(0.1)
             if self.process.poll() is not None:
                 logger.error(f"parecord exited immediately with code {self.process.returncode}")
-                send_notification("❌ Recording failed (parecord error)")
+                send_notification("Recording failed (parecord error)")
                 self._cleanup_temp_files()
                 return False
         except FileNotFoundError:
             logger.error("parecord not found. Install pulseaudio-utils.")
-            send_notification("❌ parecord not found")
+            send_notification("parecord not found")
             self._cleanup_temp_files()
             return False
         except Exception as e:
             logger.error(f"Failed to start parecord: {e}")
-            send_notification(f"❌ Recording failed: {str(e)[:30]}")
+            send_notification(f"Recording failed: {str(e)[:30]}")
             self._cleanup_temp_files()
             return False
 
         self.is_recording = True
         logger.info(f"Recording started, parecord PID: {self.process.pid}")
         play_sound(SOUND_START)
-        send_notification("🎤 Recording...")
+        send_notification("Recording...")
+        update_status("recording")
         return True
 
     def _cleanup_temp_files(self) -> None:
@@ -295,6 +734,7 @@ class AudioRecorderDaemon:
         else:
             logger.error(f"Audio file not found: {self.output_file}")
 
+        update_status("processing")
         return self.output_file
 
     def cleanup(self) -> None:
@@ -324,7 +764,7 @@ class TranscriptionPipeline:
                 if DEVICE != "cpu":
                     logger.warning(f"Failed to load model on {DEVICE}: {e}")
                     logger.warning("Falling back to CPU with int8 compute type")
-                    send_notification(f"⚠️ {DEVICE} failed, falling back to CPU")
+                    send_notification(f"{DEVICE} failed, falling back to CPU")
                     self.whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
                 else:
                     raise
@@ -339,10 +779,11 @@ class TranscriptionPipeline:
         logger.info("TranscriptionPipeline initialized")
 
     def process(self, audio_path: str) -> str:
-        """Full pipeline: transcribe + polish."""
+        """Full pipeline: transcribe + post-process + paste."""
         logger.info(f"Processing audio file: {audio_path}")
 
         send_notification("Transcribing...")
+        update_status("transcribing")
         logger.info(f"Starting transcription (engine={self.engine})...")
 
         try:
@@ -360,22 +801,27 @@ class TranscriptionPipeline:
         except ValueError as e:
             # Empty audio or no detectable language
             logger.warning(f"ValueError during transcription: {e}")
-            send_notification("⚠️  No speech detected (empty audio)")
+            send_notification("No speech detected (empty audio)")
+            update_status("idle")
             return ""
         except Exception as e:
             logger.error(f"Transcription error: {e}", exc_info=True)
-            send_notification(f"❌ Transcription error: {str(e)[:50]}")
+            send_notification(f"Transcription error: {str(e)[:50]}")
+            update_status("error", error=str(e)[:100])
             return ""
 
         if not raw_text.strip():
             logger.warning("Transcription returned empty text")
-            send_notification("⚠️  No speech detected")
+            send_notification("No speech detected")
+            update_status("idle")
             return ""
+
+        # Spoken punctuation conversion (before polishing so GPT gets cleaner input)
+        raw_text = apply_spoken_punctuation(raw_text)
 
         # Polish if enabled
         if ENABLE_POLISHING and self.openai:
             logger.info("Polishing with GPT...")
-            # No notification for polishing - happens fast
             try:
                 response = self.openai.chat.completions.create(
                     model=OPENAI_MODEL,
@@ -398,70 +844,50 @@ class TranscriptionPipeline:
             final_text = raw_text
             logger.info("Skipping polishing (disabled)")
 
+        # Word replacements (after polishing — user's final override)
+        final_text = apply_word_replacements(final_text)
+
+        # Save clipboard before we overwrite it (only when auto-pasting)
+        saved_clipboard = save_clipboard() if AUTO_PASTE else None
+
         # Copy to clipboard
         logger.info("Copying to clipboard...")
-        try:
-            if SESSION_TYPE == "wayland":
-                subprocess.run(
-                    ['wl-copy'],
-                    input=final_text.encode(),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            else:  # X11
-                subprocess.run(
-                    ['xclip', '-selection', 'clipboard'],
-                    input=final_text.encode(),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            logger.info("Copied to clipboard")
-        except FileNotFoundError as e:
-            logger.error(f"Clipboard tool not found: {e}")
-            send_notification("Clipboard tool missing")
+        _copy_to_clipboard(final_text)
+        logger.info("Copied to clipboard")
 
-        # Auto-paste if enabled (instant type with zero delay)
+        # Auto-paste if enabled
         if AUTO_PASTE:
-            time.sleep(0.2)  # Brief delay
-            try:
+            time.sleep(0.2)  # Brief delay for clipboard readiness
+            success, method_used = paste_text(final_text)
+
+            if not success:
+                send_notification("Paste failed (text copied to clipboard)")
+
+            # If Shift is held during paste, press Enter to submit
+            if is_shift_held():
+                logger.info("Shift held during paste, pressing Enter to submit")
+                time.sleep(0.1)
                 if SESSION_TYPE == "wayland":
-                    logger.info("Auto-pasting with ydotool Ctrl+V...")
-                    result = subprocess.run(
-                        ['ydotool', 'key', '29:1', '47:1', '47:0', '29:0'],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                    logger.info(f"ydotool key exit code: {result.returncode}")
-                else:  # X11
-                    logger.info("Auto-pasting with xdotool type...")
-                    result = subprocess.run(
-                        ['xdotool', 'type', '--clearmodifiers', '--delay', '0', final_text],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                    logger.info(f"xdotool type exit code: {result.returncode}")
-                # If Shift is held during paste, press Enter to submit
-                if is_shift_held():
-                    logger.info("Shift held during paste, pressing Enter to submit")
-                    time.sleep(0.1)
-                    if SESSION_TYPE == "wayland":
-                        subprocess.run(['ydotool', 'key', '28:1', '28:0'],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    else:
-                        subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except FileNotFoundError as e:
-                logger.error(f"Paste tool not found: {e}")
-                send_notification("Paste tool missing (text copied to clipboard)")
+                    subprocess.run(['ydotool', 'key', '28:1', '28:0'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             play_sound(SOUND_PASTE)
             send_notification(f"Pasted: {final_text[:50]}...")
+
+            # Restore clipboard (only for direct-type methods that don't need clipboard)
+            if saved_clipboard is not None and method_used in ("xdotool-type", "wtype"):
+                time.sleep(0.1)
+                restore_clipboard(saved_clipboard)
         else:
             logger.info("Auto-paste disabled")
             play_sound(SOUND_PASTE)
             send_notification(f"Copied: {final_text[:50]}...")
 
         logger.info("Processing complete")
+        update_status("idle", last_text=final_text[:100])
         return final_text
 
 
@@ -477,7 +903,7 @@ class TranscriptionDaemon:
         self.idle_timeout = IDLE_TIMEOUT
 
     def _process_audio(self) -> None:
-        """Process recorded audio in background."""
+        """Process recorded audio: VAD -> normalize -> transcribe."""
         # Grab the file path under lock
         with self._audio_lock:
             audio_file = self._current_audio_file
@@ -487,12 +913,20 @@ class TranscriptionDaemon:
             return
 
         try:
+            # VAD trimming — skip transcription if no speech
+            audio_file = vad_trim_audio(audio_file)
+            if audio_file is None:
+                return
+
+            # Audio normalization
+            audio_file = normalize_audio(audio_file)
+
             result = self.pipeline.process(audio_file)
             if result:
                 print(result, flush=True)
         finally:
             # Cleanup temp file
-            if os.path.exists(audio_file):
+            if audio_file and os.path.exists(audio_file):
                 try:
                     os.unlink(audio_file)
                 except OSError:
@@ -567,7 +1001,7 @@ def main():
 
     if ENABLE_POLISHING and not os.getenv("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY not set but polishing is enabled")
-        print("❌ Error: OPENAI_API_KEY not set (required when ENABLE_POLISHING=true)", file=sys.stderr)
+        print("Error: OPENAI_API_KEY not set (required when ENABLE_POLISHING=true)", file=sys.stderr)
         sys.exit(1)
 
     state_file = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-state")
@@ -711,6 +1145,7 @@ def main():
     finally:
         logger.info("Cleaning up...")
         daemon.cleanup()
+        cleanup_status()
         try:
             if os.path.exists(state_file):
                 os.unlink(state_file)

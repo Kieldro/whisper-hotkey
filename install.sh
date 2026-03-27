@@ -102,7 +102,7 @@ if [ "$ENGINE_CHOICE" = "2" ]; then
 else
     ENGINE="parakeet"
     echo "Installing Parakeet TDT..."
-    pip install -q "onnx-asr[hub]" "onnxruntime!=1.21" openai python-dotenv
+    pip install -q "onnx-asr[hub]" "onnxruntime!=1.21" openai python-dotenv "silero-vad>=5.1"
 fi
 
 echo ""
