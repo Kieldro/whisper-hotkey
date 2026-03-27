@@ -50,6 +50,11 @@ except ValueError:
     print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
     sys.exit(1)
 SAMPLE_RATE = 16000
+try:
+    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "1.2"))
+except ValueError:
+    print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
+    sys.exit(1)
 
 # Sound file paths (optional - will skip if not found)
 SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
@@ -263,7 +268,7 @@ class AudioRecorderDaemon:
 
         if self.process:
             # Delay to capture trailing speech after key release
-            time.sleep(1.2)
+            time.sleep(TRAILING_SPEECH_DELAY)
             logger.info(f"Stopping parecord process {self.process.pid}")
             # SIGINT triggers clean shutdown so parecord flushes its write buffer
             # and finalizes the WAV header. SIGTERM can kill it before flushing,
@@ -337,7 +342,7 @@ class TranscriptionPipeline:
         """Full pipeline: transcribe + polish."""
         logger.info(f"Processing audio file: {audio_path}")
 
-        # Transcribe (no notification - happens fast)
+        send_notification("Transcribing...")
         logger.info(f"Starting transcription (engine={self.engine})...")
 
         try:

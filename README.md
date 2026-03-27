@@ -94,6 +94,7 @@ Copy `.env.example` to `.env` and edit as needed:
 | `ENABLE_POLISHING` | `false` | GPT grammar/formatting cleanup |
 | `OPENAI_API_KEY` | — | Required only if polishing is enabled |
 | `IDLE_TIMEOUT` | `600` | Seconds before daemon unloads model (0 = never) |
+| `TRAILING_SPEECH_DELAY` | `1.2` | Seconds to keep recording after hotkey release |
 
 ## GPU Acceleration
 

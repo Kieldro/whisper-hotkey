@@ -38,7 +38,7 @@ All config in `.env` (loaded via python-dotenv). See `.env.example` for all opti
 
 - Shift-to-submit only works on X11 (Wayland blocks global key reads)
 - Wayland paste uses ydotool Ctrl+V (clipboard-based) to avoid ydotool type Unicode bugs
-- onnxruntime pinned to avoid version 1.24.1 (HF symlink bug)
+- onnxruntime pinned to avoid version 1.21 (HF symlink bug)
 - ctranslate2 pinned to 4.4.0 for Ubuntu 24.04 cuDNN 8 compatibility
 
 ## Dependencies

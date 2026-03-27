@@ -1,5 +1,5 @@
-faster-whisper==1.0.3  # Only needed for ENGINE=whisper
+faster-whisper>=1.2.1  # Only needed for ENGINE=whisper
 ctranslate2==4.4.0  # Only needed for ENGINE=whisper (pinned for Ubuntu 24.04 cuDNN 8)
-# onnx-asr[hub] onnxruntime<1.21  # Only needed for ENGINE=parakeet (onnxruntime 1.21+ has HF symlink bug)
+# onnx-asr[hub] onnxruntime!=1.21  # Only needed for ENGINE=parakeet (onnxruntime 1.21 has HF symlink bug)
 openai>=1.0.0
 python-dotenv

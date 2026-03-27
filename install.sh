@@ -102,7 +102,7 @@ if [ "$ENGINE_CHOICE" = "2" ]; then
 else
     ENGINE="parakeet"
     echo "Installing Parakeet TDT..."
-    pip install -q "onnx-asr[hub]" "onnxruntime<1.21" openai python-dotenv
+    pip install -q "onnx-asr[hub]" "onnxruntime!=1.21" openai python-dotenv
 fi
 
 echo ""
@@ -149,4 +149,4 @@ echo ""
 echo "Usage: Press your hotkey, speak, press again. Text appears where your cursor is."
 echo ""
 echo "Config: $PROJECT_DIR/.env"
-echo "Logs:   /tmp/whisper-hotkey.log"
+echo "Logs:   \${XDG_RUNTIME_DIR:-/tmp}/whisper-hotkey.log"
