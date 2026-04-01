@@ -542,28 +542,28 @@ class TranscriptionPipeline:
 
         # Auto-paste if enabled
         if AUTO_PASTE:
-            # Check shift BEFORE paste — on macOS, holding Shift during
-            # osascript Cmd+V sends Cmd+Shift+V (Paste Special), which is wrong.
-            # So: detect shift → wait for release → paste cleanly → press Enter.
             submit_after_paste = is_shift_held()
-            if submit_after_paste and IS_MACOS:
-                logger.info("Shift held — waiting for release before paste...")
-                deadline = time.time() + 5.0
-                while is_shift_held() and time.time() < deadline:
-                    time.sleep(0.05)
-                time.sleep(0.1)  # small buffer after release
-
             time.sleep(0.2)  # Brief delay
             try:
                 if IS_MACOS:
-                    logger.info("Auto-pasting with osascript Cmd+V...")
-                    result = subprocess.run(
-                        ['osascript', '-e',
-                         'tell application "System Events" to keystroke "v" using {command down}'],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                    logger.info(f"osascript exit code: {result.returncode}")
+                    # Use CGEvent for paste — ignores physical modifiers (Shift etc.)
+                    # osascript keystroke is affected by held keys, causing Cmd+Shift+V
+                    logger.info("Auto-pasting with CGEvent Cmd+V...")
+                    try:
+                        from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
+                                            CGEventPost, kCGEventFlagMaskCommand, kCGHIDEventTap)
+                        # Cmd+V: keycode 9 = V
+                        for pressed in (True, False):
+                            ev = CGEventCreateKeyboardEvent(None, 9, pressed)
+                            CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+                            CGEventPost(kCGHIDEventTap, ev)
+                        logger.info("CGEvent Cmd+V sent")
+                    except Exception as e:
+                        logger.warning(f"CGEvent failed ({e}), falling back to osascript")
+                        subprocess.run(
+                            ['osascript', '-e',
+                             'tell application "System Events" to keystroke "v" using {command down}'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif SESSION_TYPE == "wayland":
                     logger.info("Auto-pasting with ydotool Ctrl+V...")
                     result = subprocess.run(
@@ -585,10 +585,18 @@ class TranscriptionPipeline:
                     logger.info("Shift-to-submit: pressing Enter")
                     time.sleep(0.1)
                     if IS_MACOS:
-                        subprocess.run(
-                            ['osascript', '-e',
-                             'tell application "System Events" to key code 36'],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        try:
+                            from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
+                                                CGEventPost, kCGHIDEventTap)
+                            for pressed in (True, False):
+                                ev = CGEventCreateKeyboardEvent(None, 36, pressed)
+                                CGEventSetFlags(ev, 0)
+                                CGEventPost(kCGHIDEventTap, ev)
+                        except Exception:
+                            subprocess.run(
+                                ['osascript', '-e',
+                                 'tell application "System Events" to key code 36'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     elif SESSION_TYPE == "wayland":
                         subprocess.run(['ydotool', 'key', '28:1', '28:0'],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
