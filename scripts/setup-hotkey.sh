@@ -7,6 +7,7 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WRAPPER_SCRIPT="$PROJECT_DIR/scripts/hotkey-wrapper.sh"
 VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
+OS_TYPE=$(uname -s)
 
 echo "🔧 Voice Transcription Hotkey Setup"
 echo "===================================="
@@ -17,6 +18,38 @@ if [ ! -f "$VENV_PYTHON" ]; then
     echo "❌ Virtual environment not found at $VENV_PYTHON"
     echo "Run: python3 -m venv venv && pip install -r requirements.txt"
     exit 1
+fi
+
+# --- macOS: use skhd ---
+if [ "$OS_TYPE" = "Darwin" ]; then
+    SKHD_CONFIG="$HOME/.config/skhd/skhdrc"
+    mkdir -p "$(dirname "$SKHD_CONFIG")"
+
+    echo "📝 macOS setup using skhd:"
+    echo "Hotkey: Cmd+Shift+V (press once to start, again to stop)"
+    echo ""
+
+    if grep -q "whisper-hotkey" "$SKHD_CONFIG" 2>/dev/null; then
+        echo "⚠️  Hotkey already exists in skhd config"
+    else
+        echo "" >> "$SKHD_CONFIG"
+        echo "# Voice transcription hotkey (daemon mode)" >> "$SKHD_CONFIG"
+        echo "shift + cmd - v : $WRAPPER_SCRIPT" >> "$SKHD_CONFIG"
+        echo "✅ Added to $SKHD_CONFIG"
+    fi
+
+    if command -v skhd &>/dev/null; then
+        brew services restart skhd 2>/dev/null || skhd --reload 2>/dev/null || true
+        echo "✅ skhd reloaded"
+    else
+        echo "⚠️  skhd not installed. Run: brew install skhd && brew services start skhd"
+    fi
+
+    echo ""
+    echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add Terminal (or your terminal app)"
+    echo ""
+    echo "✅ Setup complete!"
+    exit 0
 fi
 
 # Detect desktop environment

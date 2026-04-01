@@ -1,5 +1,8 @@
 faster-whisper>=1.2.1  # Only needed for ENGINE=whisper
-ctranslate2==4.4.0  # Only needed for ENGINE=whisper (pinned for Ubuntu 24.04 cuDNN 8)
+ctranslate2>=4.0.0  # Only needed for ENGINE=whisper (pin <=4.4.0 on Ubuntu 24.04/cuDNN 8)
 # onnx-asr[hub] onnxruntime!=1.21  # Only needed for ENGINE=parakeet (onnxruntime 1.21 has HF symlink bug)
 openai>=1.0.0
 python-dotenv
+sounddevice>=0.4.0  # macOS audio recording (replaces parecord)
+soundfile>=0.12.0   # WAV file writing for sounddevice
+numpy>=1.20.0       # Required by sounddevice
