@@ -548,10 +548,13 @@ class TranscriptionPipeline:
                         from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
                                             CGEventPost, kCGEventFlagMaskCommand, kCGHIDEventTap)
                         # Cmd+V: keycode 9 = V
-                        for pressed in (True, False):
-                            ev = CGEventCreateKeyboardEvent(None, 9, pressed)
-                            CGEventSetFlags(ev, kCGEventFlagMaskCommand)
-                            CGEventPost(kCGHIDEventTap, ev)
+                        ev = CGEventCreateKeyboardEvent(None, 9, True)
+                        CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+                        CGEventPost(kCGHIDEventTap, ev)
+                        time.sleep(0.05)
+                        ev = CGEventCreateKeyboardEvent(None, 9, False)
+                        CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+                        CGEventPost(kCGHIDEventTap, ev)
                         logger.info("CGEvent Cmd+V sent")
                     except Exception as e:
                         logger.warning(f"CGEvent failed ({e}), falling back to osascript")
@@ -578,15 +581,19 @@ class TranscriptionPipeline:
                 # Submit with Enter if Shift was held
                 if submit_after_paste or (not IS_MACOS and is_shift_held()):
                     logger.info("Shift-to-submit: pressing Enter")
-                    time.sleep(0.1)
+                    time.sleep(0.5)  # wait for paste to be processed by app
                     if IS_MACOS:
                         try:
                             from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
                                                 CGEventPost, kCGHIDEventTap)
-                            for pressed in (True, False):
-                                ev = CGEventCreateKeyboardEvent(None, 36, pressed)
-                                CGEventSetFlags(ev, 0)
-                                CGEventPost(kCGHIDEventTap, ev)
+                            ev = CGEventCreateKeyboardEvent(None, 36, True)
+                            CGEventSetFlags(ev, 0)
+                            CGEventPost(kCGHIDEventTap, ev)
+                            time.sleep(0.05)
+                            ev = CGEventCreateKeyboardEvent(None, 36, False)
+                            CGEventSetFlags(ev, 0)
+                            CGEventPost(kCGHIDEventTap, ev)
+                            logger.info("CGEvent Enter sent")
                         except Exception:
                             subprocess.run(
                                 ['osascript', '-e',
