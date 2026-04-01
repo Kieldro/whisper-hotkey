@@ -148,20 +148,14 @@ def play_sound(sound_file: str) -> None:
 
 
 def is_shift_held() -> bool:
-    """Check if Shift is currently pressed at paste time.
+    """Check if Shift is currently held.
 
-    User holds Shift while transcription runs; checked right before paste.
-    macOS: Quartz CGEventSourceKeyState. Linux: X11 XQueryKeymap.
+    macOS: Hammerspoon tracks Shift state via a flag file (it has Accessibility
+    access; background Python processes don't). File exists = Shift is down.
+    Linux: reads X11 keymap directly.
     """
     if IS_MACOS:
-        try:
-            from Quartz import CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState
-            # kVK_Shift = 0x38, kVK_RightShift = 0x3C
-            left = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, 0x38)
-            right = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, 0x3C)
-            return bool(left or right)
-        except Exception:
-            return False
+        return os.path.exists(os.path.join(RUNTIME_DIR, "whisper-hotkey-shift"))
     else:
         try:
             x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
