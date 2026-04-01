@@ -210,7 +210,12 @@ logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
 
 
 class AudioRecorderDaemon:
-    """Non-blocking audio recorder. Uses sounddevice on macOS, parecord on Linux."""
+    """Non-blocking audio recorder. Uses sounddevice on macOS, parecord on Linux.
+
+    On macOS the CoreAudio stream is opened once and kept alive for the lifetime
+    of the daemon. start_recording/stop_recording just gate what gets captured,
+    eliminating the ~0.7s CoreAudio init penalty on every press after the first.
+    """
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
@@ -219,6 +224,37 @@ class AudioRecorderDaemon:
         self.output_file: Optional[str] = None
         self._sd_stream = None
         self._audio_queue = None
+
+    def _sd_callback(self, indata, frames, t, status):
+        """Audio callback — only enqueues frames while is_recording is True."""
+        if status:
+            logger.warning(f"Audio status: {status}")
+        if self.is_recording and self._audio_queue is not None:
+            self._audio_queue.put(indata.copy())
+
+    def _open_stream_macos(self) -> bool:
+        """Open the persistent CoreAudio stream (called once). Returns True on success."""
+        import queue as _queue
+        try:
+            import sounddevice as sd
+        except ImportError:
+            logger.error("sounddevice not installed. Run: pip install sounddevice soundfile numpy")
+            return False
+        self._audio_queue = _queue.Queue()
+        try:
+            self._sd_stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype='int16',
+                callback=self._sd_callback,
+            )
+            self._sd_stream.start()
+            logger.info("Persistent CoreAudio stream opened")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to open audio stream: {e}")
+            send_notification(f"❌ Audio init failed: {str(e)[:30]}")
+            return False
 
     def start_recording(self) -> bool:
         """Start recording. Returns True on success."""
@@ -230,43 +266,26 @@ class AudioRecorderDaemon:
         return self._start_recording_linux()
 
     def _start_recording_macos(self) -> bool:
-        """Record audio using sounddevice (macOS CoreAudio)."""
-        import queue as _queue
-        try:
-            import sounddevice as sd
-        except ImportError:
-            logger.error("sounddevice not installed. Run: pip install sounddevice soundfile numpy")
-            send_notification("❌ sounddevice not installed")
-            return False
+        """Begin capturing audio into a new temp file (stream already open)."""
+        # Open stream on first call; stays open for all subsequent recordings.
+        if self._sd_stream is None:
+            if not self._open_stream_macos():
+                return False
+
+        # Clear any stale frames accumulated while idle
+        while self._audio_queue and not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except Exception:
+                break
 
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         self.output_file = temp_file.name
         temp_file.close()
         logger.info(f"Created temp audio file: {self.output_file}")
 
-        self._audio_queue = _queue.Queue()
-
-        def callback(indata, frames, time, status):
-            if status:
-                logger.warning(f"Audio status: {status}")
-            self._audio_queue.put(indata.copy())
-
-        try:
-            self._sd_stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype='int16',
-                callback=callback
-            )
-            self._sd_stream.start()
-        except Exception as e:
-            logger.error(f"Failed to start sounddevice: {e}")
-            send_notification(f"❌ Recording failed: {str(e)[:30]}")
-            self._cleanup_temp_files()
-            return False
-
         self.is_recording = True
-        logger.info("Recording started (sounddevice/CoreAudio)")
+        logger.info("Recording started (persistent CoreAudio stream)")
         play_sound(SOUND_START)
         send_notification("🎤 Recording...")
         return True
@@ -333,18 +352,13 @@ class AudioRecorderDaemon:
         return self._stop_recording_linux()
 
     def _stop_recording_macos(self) -> Optional[str]:
-        """Stop sounddevice recording and write WAV file."""
+        """Stop capturing and write WAV (stream stays open for next recording)."""
         logger.info("Stopping recording (sounddevice)...")
-        self.is_recording = False
+        self.is_recording = False  # callback stops enqueuing immediately
 
         time.sleep(TRAILING_SPEECH_DELAY)
 
-        if self._sd_stream:
-            self._sd_stream.stop()
-            self._sd_stream.close()
-            self._sd_stream = None
-
-        # Drain queue and write WAV
+        # Drain queue and write WAV (stream remains open)
         frames = []
         while self._audio_queue and not self._audio_queue.empty():
             frames.append(self._audio_queue.get())
