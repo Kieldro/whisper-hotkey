@@ -20,33 +20,38 @@ if [ ! -f "$VENV_PYTHON" ]; then
     exit 1
 fi
 
-# --- macOS: use skhd ---
+# --- macOS: use Hammerspoon ---
 if [ "$OS_TYPE" = "Darwin" ]; then
-    SKHD_CONFIG="$HOME/.config/skhd/skhdrc"
-    mkdir -p "$(dirname "$SKHD_CONFIG")"
+    HS_CONFIG="$HOME/.hammerspoon/init.lua"
+    mkdir -p "$(dirname "$HS_CONFIG")"
 
-    echo "📝 macOS setup using skhd:"
-    echo "Hotkey: Cmd+Shift+V (press once to start, again to stop)"
+    echo "📝 macOS setup using Hammerspoon:"
+    echo "Hotkey: Option+Space (press once to start, again to stop)"
     echo ""
 
-    if grep -q "whisper-hotkey" "$SKHD_CONFIG" 2>/dev/null; then
-        echo "⚠️  Hotkey already exists in skhd config"
+    if grep -q "whisper-hotkey" "$HS_CONFIG" 2>/dev/null; then
+        echo "⚠️  Hotkey already exists in Hammerspoon config"
     else
-        echo "" >> "$SKHD_CONFIG"
-        echo "# Voice transcription hotkey (daemon mode)" >> "$SKHD_CONFIG"
-        echo "shift + cmd - v : $WRAPPER_SCRIPT" >> "$SKHD_CONFIG"
-        echo "✅ Added to $SKHD_CONFIG"
+        cat >> "$HS_CONFIG" << LUAEOF
+
+-- Whisper Hotkey: Option+Space → toggle push-to-talk transcription
+local wrapper = "$WRAPPER_SCRIPT"
+hs.hotkey.bind({"alt"}, "space", function()
+    hs.task.new(wrapper, nil):start()
+end)
+LUAEOF
+        echo "✅ Added to $HS_CONFIG"
     fi
 
-    if command -v skhd &>/dev/null; then
-        brew services restart skhd 2>/dev/null || skhd --reload 2>/dev/null || true
-        echo "✅ skhd reloaded"
+    if [ -d "/Applications/Hammerspoon.app" ]; then
+        open /Applications/Hammerspoon.app
+        echo "✅ Hammerspoon launched — reload config with Cmd+Shift+R in the Hammerspoon console"
     else
-        echo "⚠️  skhd not installed. Run: brew install skhd && brew services start skhd"
+        echo "⚠️  Hammerspoon not installed. Run: brew install --cask hammerspoon"
     fi
 
     echo ""
-    echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add Terminal (or your terminal app)"
+    echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add Hammerspoon"
     echo ""
     echo "✅ Setup complete!"
     exit 0

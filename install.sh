@@ -56,12 +56,12 @@ fi
 
 case $PKG_MGR in
     brew)
-        # macOS: skhd for global hotkeys (pbcopy/osascript are built-in)
+        # macOS: Hammerspoon for global hotkeys (pbcopy/osascript are built-in)
         if ! command -v brew &>/dev/null; then
             echo "❌ Homebrew not found. Install from https://brew.sh first."
             exit 1
         fi
-        brew install skhd 2>/dev/null || true
+        brew install --cask hammerspoon 2>/dev/null || true
         ;;
     apt)
         sudo apt update -qq
