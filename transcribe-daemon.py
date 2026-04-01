@@ -147,16 +147,22 @@ def play_sound(sound_file: str) -> None:
 
 
 def is_shift_held() -> bool:
-    """Check if Shift is currently pressed."""
+    """Check if Shift was held when the hotkey was pressed.
+
+    macOS: Hammerspoon writes a flag file when Option+Shift+Space is pressed.
+    This is more reliable than Quartz key-state polling because the daemon
+    checks seconds after the keypress (after trailing delay + transcription).
+    Linux: reads X11 keymap directly (paste happens fast enough).
+    """
     if IS_MACOS:
-        try:
-            from Quartz import CGEventSourceKeyState, kCGEventSourceStateCombinedSessionState
-            # kVK_Shift = 0x38, kVK_RightShift = 0x3C
-            left = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, 0x38)
-            right = CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, 0x3C)
-            return bool(left or right)
-        except Exception:
-            return False
+        shift_flag = os.path.join(RUNTIME_DIR, "whisper-hotkey-shift")
+        if os.path.exists(shift_flag):
+            try:
+                os.unlink(shift_flag)
+            except OSError:
+                pass
+            return True
+        return False
     else:
         try:
             x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
