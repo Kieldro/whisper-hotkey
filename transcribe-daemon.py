@@ -542,6 +542,17 @@ class TranscriptionPipeline:
 
         # Auto-paste if enabled
         if AUTO_PASTE:
+            # Check shift BEFORE paste — on macOS, holding Shift during
+            # osascript Cmd+V sends Cmd+Shift+V (Paste Special), which is wrong.
+            # So: detect shift → wait for release → paste cleanly → press Enter.
+            submit_after_paste = is_shift_held()
+            if submit_after_paste and IS_MACOS:
+                logger.info("Shift held — waiting for release before paste...")
+                deadline = time.time() + 5.0
+                while is_shift_held() and time.time() < deadline:
+                    time.sleep(0.05)
+                time.sleep(0.1)  # small buffer after release
+
             time.sleep(0.2)  # Brief delay
             try:
                 if IS_MACOS:
@@ -569,9 +580,9 @@ class TranscriptionPipeline:
                         stderr=subprocess.DEVNULL
                     )
                     logger.info(f"xdotool type exit code: {result.returncode}")
-                # If Shift is held during paste, press Enter to submit
-                if is_shift_held():
-                    logger.info("Shift held during paste, pressing Enter to submit")
+                # Submit with Enter if Shift was held
+                if submit_after_paste or (not IS_MACOS and is_shift_held()):
+                    logger.info("Shift-to-submit: pressing Enter")
                     time.sleep(0.1)
                     if IS_MACOS:
                         subprocess.run(
