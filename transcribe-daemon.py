@@ -799,18 +799,21 @@ def main():
     # Create state file immediately so extra presses during load send STOP (not START)
     Path(state_file).touch()
 
-    # Play calming sound while model loads
+    # Play loading feedback while model loads
     loading_sound_proc = None
-    if SOUND_LOADING and os.path.exists(SOUND_LOADING):
-        try:
-            cmd = ['afplay', SOUND_LOADING] if IS_MACOS else ['paplay', SOUND_LOADING]
+    try:
+        if IS_MACOS:
             loading_sound_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                ['say', 'Loading voice model'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-        except FileNotFoundError:
-            pass
+        elif SOUND_LOADING and os.path.exists(SOUND_LOADING):
+            loading_sound_proc = subprocess.Popen(
+                ['paplay', SOUND_LOADING],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+    except FileNotFoundError:
+        pass
 
     logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
