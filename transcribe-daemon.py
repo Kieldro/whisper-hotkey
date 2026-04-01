@@ -62,7 +62,8 @@ except ValueError:
 # Sound file paths (optional - will skip if not found)
 if IS_MACOS:
     SOUND_START = os.getenv("SOUND_START", "/System/Library/Sounds/Ping.aiff")
-    SOUND_LOADING = os.getenv("SOUND_LOADING", "/System/Library/Sounds/Sosumi.aiff")
+    _chime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds", "loading-chime.wav")
+    SOUND_LOADING = os.getenv("SOUND_LOADING", _chime)
     SOUND_PASTE = os.getenv("SOUND_PASTE", "/System/Library/Sounds/Glass.aiff")
 else:
     SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
@@ -799,21 +800,18 @@ def main():
     # Create state file immediately so extra presses during load send STOP (not START)
     Path(state_file).touch()
 
-    # Play loading feedback while model loads
+    # Play calming sound while model loads
     loading_sound_proc = None
-    try:
-        if IS_MACOS:
+    if SOUND_LOADING and os.path.exists(SOUND_LOADING):
+        try:
+            cmd = ['afplay', SOUND_LOADING] if IS_MACOS else ['paplay', SOUND_LOADING]
             loading_sound_proc = subprocess.Popen(
-                ['say', 'Loading voice model'],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
-        elif SOUND_LOADING and os.path.exists(SOUND_LOADING):
-            loading_sound_proc = subprocess.Popen(
-                ['paplay', SOUND_LOADING],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-    except FileNotFoundError:
-        pass
+        except FileNotFoundError:
+            pass
 
     logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
