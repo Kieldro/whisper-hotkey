@@ -593,7 +593,7 @@ class TranscriptionPipeline:
                 # Submit with Enter if Shift was held
                 if submit_after_paste or (not IS_MACOS and is_shift_held()):
                     logger.info("Shift-to-submit: pressing Enter")
-                    time.sleep(0.5)  # wait for paste to be processed by app
+                    time.sleep(0.2)  # wait for paste to be processed by app
                     if IS_MACOS:
                         try:
                             from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
