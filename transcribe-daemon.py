@@ -250,19 +250,31 @@ class AudioRecorderDaemon:
                 logger.warning(f"Audio status: {status}")
             self._audio_queue.put(indata.copy())
 
-        try:
-            self._sd_stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype='int16',
-                callback=callback
-            )
-            self._sd_stream.start()
-        except Exception as e:
-            logger.error(f"Failed to start sounddevice: {e}")
-            send_notification(f"❌ Recording failed: {str(e)[:30]}")
-            self._cleanup_temp_files()
-            return False
+        for attempt in range(2):
+            try:
+                self._sd_stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype='int16',
+                    callback=callback
+                )
+                self._sd_stream.start()
+                break
+            except Exception as e:
+                if attempt == 0:
+                    # PortAudio handle may be stale after sleep/wake — reinit and retry
+                    logger.warning(f"Audio open failed ({e}), reinitializing PortAudio...")
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                else:
+                    logger.error(f"Failed to start sounddevice after retry: {e}")
+                    send_notification(f"❌ Recording failed: {str(e)[:30]}")
+                    self._cleanup_temp_files()
+                    return False
 
         self.is_recording = True
         logger.info("Recording started (sounddevice/CoreAudio)")
