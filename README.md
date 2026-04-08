@@ -1,27 +1,8 @@
 # Whisper Hotkey
 
-Push-to-talk voice transcription for Linux. Press a hotkey, speak, press again — your words appear instantly as text wherever your cursor is.
+Push-to-talk voice transcription for Linux. Press a hotkey, speak, press again — text appears where your cursor is.
 
-Runs 100% locally with [Parakeet TDT v3](https://github.com/NVIDIA/NeMo) (25 languages) or [faster-whisper](https://github.com/guillaumekln/faster-whisper). No cloud, no subscription, no data leaves your machine.
-
-## How It Works
-
-1. Press your hotkey
-2. Speak naturally
-3. Press the hotkey again
-4. Text is transcribed and pasted into your active window
-
-Transcription takes ~0.3-0.6s after you stop recording. The model stays loaded in memory so subsequent uses are instant.
-
-## Features
-
-- **Fast local transcription** — Parakeet TDT (~0.3s) or faster-whisper (~0.5s) on GPU
-- **Auto-paste** — text appears wherever your cursor is, no manual pasting
-- **Push-to-talk daemon** — background process with audio feedback (start chime, wind chime during model load, completion sound after paste)
-- **Shift-to-submit** — hold Shift during paste to press Enter (great for chat apps)
-- **Optional GPT polishing** — clean up grammar/formatting via OpenAI API
-- **Works offline** — no internet required in default mode
-- **X11 and Wayland** — auto-detects your session type
+Runs locally with [Parakeet TDT](https://github.com/NVIDIA/NeMo) or [faster-whisper](https://github.com/guillaumekln/faster-whisper). No cloud, no subscription.
 
 ## Quick Start
 
@@ -31,108 +12,90 @@ cd whisper-hotkey
 ./install.sh
 ```
 
-The installer handles system deps, Python environment, engine selection, GPU detection, hotkey setup, and model download.
+Bind your hotkey to `scripts/hotkey-wrapper.sh`. Press it, speak, press again.
 
-<details>
-<summary>Manual installation</summary>
+## Features
 
-### 1. Install dependencies
-
-```bash
-# Ubuntu/Debian (X11)
-sudo apt install python3-venv python3-pip pulseaudio-utils \
-  xclip xdotool libnotify-bin
-
-# Ubuntu/Debian (Wayland)
-sudo apt install python3-venv python3-pip pulseaudio-utils \
-  wl-clipboard ydotool libnotify-bin
-# sudo systemctl enable --now ydotool
-```
-
-### 2. Clone and install
-
-```bash
-git clone https://github.com/Kieldro/whisper-hotkey.git
-cd whisper-hotkey
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-</details>
-
-### 3. Set up your hotkey
-
-Bind your preferred key combo to run:
-
-```
-~/repos/whisper-hotkey/scripts/hotkey-wrapper.sh
-```
-
-**i3/sway** — add to config:
-```
-bindsym $mod+Shift+v exec ~/repos/whisper-hotkey/scripts/hotkey-wrapper.sh
-```
-
-**GNOME/KDE** — add a custom keyboard shortcut pointing to the same script.
-
-### 4. Use it
-
-Press your hotkey, talk, press it again. Done.
+- **~0.3s transcription** with Parakeet TDT (25 languages) or faster-whisper on GPU
+- **Auto-paste** into the active window via xdotool/ydotool/wtype
+- **Voice Activity Detection** — trims silence, skips transcription when no speech detected
+- **Audio normalization** — handles quiet and loud mics automatically
+- **Paste fallback chain** — tries multiple paste methods until one works
+- **Clipboard preservation** — saves and restores your clipboard after pasting
+- **Word replacements** — fix recurring misrecognitions via `replacements.json`
+- **Status overlay** — floating widget shows recording/transcribing state
+- **Shift-to-submit** — hold Shift during paste to press Enter (for chat apps)
+- **Optional GPT polishing** — grammar cleanup via OpenAI API
+- **Spoken punctuation** — say "period", "comma", "new line" (opt-in)
+- **X11 and Wayland** support with auto-detection
 
 ## Configuration
 
-Copy `.env.example` to `.env` and edit as needed:
+Edit `.env` (copy from `.env.example`):
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `ENGINE` | `parakeet` | `parakeet` (faster) or `whisper` |
-| `WHISPER_MODEL` | `small` | Whisper model size (ignored for parakeet) |
-| `DEVICE` | `cpu` | `cpu` or `cuda` for GPU acceleration |
+|---|---|---|
+| `ENGINE` | `parakeet` | `parakeet` or `whisper` |
+| `DEVICE` | `cpu` | `cpu`, `cuda`, or `auto` |
 | `COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (GPU) |
-| `AUTO_PASTE` | `true` | Paste transcription into active window |
-| `ENABLE_POLISHING` | `false` | GPT grammar/formatting cleanup |
-| `OPENAI_API_KEY` | — | Required only if polishing is enabled |
-| `IDLE_TIMEOUT` | `600` | Seconds before daemon unloads model (0 = never) |
-| `TRAILING_SPEECH_DELAY` | `1.2` | Seconds to keep recording after hotkey release |
+| `AUTO_PASTE` | `true` | Auto-paste into active window |
+| `PASTE_METHOD` | `auto` | `auto`, `wtype`, `xdotool-type`, `xdotool-clipboard`, `ydotool-clipboard` |
+| `ENABLE_VAD` | `true` | Trim silence, skip empty recordings |
+| `VAD_THRESHOLD` | `0.5` | Speech detection sensitivity (0-1) |
+| `ENABLE_AUDIO_NORMALIZATION` | `true` | Normalize mic volume levels |
+| `ENABLE_SPOKEN_PUNCTUATION` | `false` | Convert "period" to `.`, etc. |
+| `ENABLE_NOTIFICATIONS` | `true` | Desktop notification banners |
+| `REPLACEMENTS_FILE` | `./replacements.json` | Word replacement dictionary |
+| `IDLE_TIMEOUT` | `600` | Seconds before model unloads (0 = never) |
+| `TRAILING_SPEECH_DELAY` | `0.2` | Seconds to record after hotkey release |
+| `ENABLE_POLISHING` | `false` | GPT grammar cleanup (needs `OPENAI_API_KEY`) |
+
+## Word Replacements
+
+Create `replacements.json` to fix words the model consistently gets wrong:
+
+```json
+{
+  "gonna": "going to",
+  "kubernetes": "Kubernetes",
+  "mycorp": "MyCorp"
+}
+```
+
+## Status Overlay
+
+A floating widget that shows recording/transcribing state:
+
+```bash
+python3 whisper-status.py &
+```
+
+Auto-hides when idle, reappears on next recording.
 
 ## GPU Acceleration
 
-For 3-5x faster transcription with an NVIDIA GPU:
-
 ```bash
-# .env
+# In .env
 DEVICE=cuda
 COMPUTE_TYPE=float16
-```
-
-If you get cuDNN errors on Ubuntu 24.04:
-```bash
-sudo apt install nvidia-cudnn
-pip install --force-reinstall ctranslate2==4.4.0
 ```
 
 ## Architecture
 
 ```
-Hotkey press
-  → parecord captures audio
-  → Parakeet TDT / faster-whisper transcribes locally
-  → (optional) GPT-4o mini polishes text
-  → xdotool/ydotool pastes into active window
+Hotkey → Record (parecord) → VAD trim → Normalize
+→ Transcribe (Parakeet/Whisper) → Punctuation → Replacements
+→ Save clipboard → Paste (fallback chain) → Restore clipboard
 ```
 
-The daemon (`transcribe-daemon.py`) loads the model once and stays resident for 10 minutes (configurable). First launch plays a wind chime while the model loads (~2-3s), then auto-starts recording. Subsequent recordings start instantly.
+The daemon loads the model once and stays resident. First press plays a chime while loading (~2-3s), then auto-starts recording.
 
 ## Troubleshooting
 
-**No audio detected** — test your mic with `parecord --format=s16le --rate=16000 --channels=1 test.wav`, speak, Ctrl+C, then `paplay test.wav`.
-
-**Not pasting** — make sure `xdotool` (X11) or `ydotool` (Wayland) is installed and working.
-
-**Model download fails** — models download on first run. Run `python3 -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v3')"` manually to debug.
-
-**Check logs** — `tail -f /tmp/whisper-hotkey.log`
+- **Check logs**: `tail -f $XDG_RUNTIME_DIR/whisper-hotkey.log`
+- **Kill daemon**: `pkill -f transcribe-daemon`
+- **Test mic**: `parecord --format=s16le --rate=16000 --channels=1 test.wav`
+- **Status file**: `cat $XDG_RUNTIME_DIR/whisper-hotkey-status.json`
 
 ## License
 

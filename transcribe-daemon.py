@@ -55,7 +55,7 @@ except ValueError:
     sys.exit(1)
 SAMPLE_RATE = 16000
 try:
-    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "1.2"))
+    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.2"))
 except ValueError:
     print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
     sys.exit(1)
@@ -68,9 +68,12 @@ except ValueError:
     print(f"Error: VAD_THRESHOLD='{os.getenv('VAD_THRESHOLD')}' is not a valid number", file=sys.stderr)
     sys.exit(1)
 ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
-ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "true").lower() == "true"
+ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
 PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
+ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
+RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"
+ENABLE_OVERLAY = os.getenv("ENABLE_OVERLAY", "true").lower() == "true"
 
 # Sound file paths (optional - will skip if not found)
 SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
@@ -129,6 +132,8 @@ def validate_config() -> None:
 
 def send_notification(message: str) -> None:
     """Send desktop notification that replaces previous ones."""
+    if not ENABLE_NOTIFICATIONS:
+        return
     try:
         subprocess.run(
             ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message],
@@ -662,8 +667,8 @@ class AudioRecorderDaemon:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-            # Verify process actually started
-            time.sleep(0.1)
+            # Verify process actually started (short wait to detect immediate failure)
+            time.sleep(0.02)
             if self.process.poll() is not None:
                 logger.error(f"parecord exited immediately with code {self.process.returncode}")
                 send_notification("Recording failed (parecord error)")
@@ -847,8 +852,8 @@ class TranscriptionPipeline:
         # Word replacements (after polishing — user's final override)
         final_text = apply_word_replacements(final_text)
 
-        # Save clipboard before we overwrite it (only when auto-pasting)
-        saved_clipboard = save_clipboard() if AUTO_PASTE else None
+        # Save clipboard before we overwrite it (only when auto-pasting with restore enabled)
+        saved_clipboard = save_clipboard() if (AUTO_PASTE and RESTORE_CLIPBOARD) else None
 
         # Copy to clipboard
         logger.info("Copying to clipboard...")
@@ -857,7 +862,7 @@ class TranscriptionPipeline:
 
         # Auto-paste if enabled
         if AUTO_PASTE:
-            time.sleep(0.2)  # Brief delay for clipboard readiness
+            # No clipboard wait needed: _copy_to_clipboard already blocks on subprocess.run
             success, method_used = paste_text(final_text)
 
             if not success:
@@ -1052,6 +1057,21 @@ def main():
     # We now hold the lock
     logger.info(f"Acquired daemon lock, PID written to {daemon_lock_file}")
 
+    # Launch status overlay
+    overlay_proc = None
+    if ENABLE_OVERLAY:
+        overlay_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper-status.py")
+        if os.path.exists(overlay_script):
+            try:
+                overlay_proc = subprocess.Popen(
+                    [shutil.which("python3") or "python3", overlay_script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                logger.info(f"Started status overlay (PID {overlay_proc.pid})")
+            except Exception as e:
+                logger.warning(f"Failed to start status overlay: {e}")
+
     # Signal handlers - use threading.Event for thread-safe signaling
     # NOTE: Signal handlers should only set flags, not call complex functions like logging
     start_recording_event = threading.Event()
@@ -1135,8 +1155,8 @@ def main():
                 break
 
             # Wait for signals or timeout (efficient polling)
-            # Wakes immediately on signals, sleeps otherwise
-            shutdown_event.wait(timeout=0.1)
+            # 20ms gives snappy signal response without wasting CPU
+            shutdown_event.wait(timeout=0.02)
 
         logger.info("Daemon loop exiting")
 
@@ -1144,6 +1164,9 @@ def main():
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
     finally:
         logger.info("Cleaning up...")
+        if overlay_proc and overlay_proc.poll() is None:
+            overlay_proc.terminate()
+            logger.info("Terminated status overlay")
         daemon.cleanup()
         cleanup_status()
         try:

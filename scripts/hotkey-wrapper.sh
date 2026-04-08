@@ -15,7 +15,7 @@ echo "VENV_PYTHON: $VENV_PYTHON" >> "$LOG_FILE"
 echo "DAEMON_SCRIPT: $DAEMON_SCRIPT" >> "$LOG_FILE"
 
 # Run daemon in toggle mode (don't background - runs in foreground or sends signal)
-"$VENV_PYTHON" "$DAEMON_SCRIPT" >> "$LOG_FILE" 2>&1 &
+"$VENV_PYTHON" "$DAEMON_SCRIPT" 2>/dev/null &
 DAEMON_PID=$!
 
 echo "Daemon started/signaled with PID: $DAEMON_PID" >> "$LOG_FILE"
