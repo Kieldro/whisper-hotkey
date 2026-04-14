@@ -19,7 +19,6 @@ from typing import Optional
 import platform
 IS_MACOS = platform.system() == "Darwin"
 
-from openai import OpenAI
 from dotenv import load_dotenv
 import time
 
@@ -150,12 +149,17 @@ def play_sound(sound_file: str) -> None:
 def is_shift_held() -> bool:
     """Check if Shift is currently held.
 
-    macOS: Hammerspoon tracks Shift state via a flag file (it has Accessibility
-    access; background Python processes don't). File exists = Shift is down.
+    macOS: CGEventSourceFlagsState reads physical modifier key state directly.
     Linux: reads X11 keymap directly.
     """
     if IS_MACOS:
-        return os.path.exists(os.path.join(RUNTIME_DIR, "whisper-hotkey-shift"))
+        try:
+            from Quartz import CGEventSourceFlagsState, kCGEventFlagMaskShift
+            # kCGEventSourceStateHIDSystemState (1) = physical key state
+            flags = CGEventSourceFlagsState(1)
+            return bool(flags & kCGEventFlagMaskShift)
+        except Exception:
+            return False
     else:
         try:
             x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
@@ -452,6 +456,7 @@ class TranscriptionPipeline:
 
         if ENABLE_POLISHING:
             logger.info("Initializing OpenAI client...")
+            from openai import OpenAI
             self.openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         else:
             self.openai = None
