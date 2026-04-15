@@ -662,6 +662,10 @@ class AudioRecorderDaemon:
                     '--format=s16le',
                     f'--rate={self.sample_rate}',
                     '--channels=1',
+                    # PulseAudio defaults to ~1s record latency; on SIGINT any
+                    # audio still buffered server-side is dropped, losing the
+                    # tail of speech. Ask for tight latency instead.
+                    '--latency-msec=30',
                     self.output_file
                 ],
                 stdout=subprocess.DEVNULL,
