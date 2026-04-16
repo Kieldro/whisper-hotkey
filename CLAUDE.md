@@ -7,6 +7,7 @@ Push-to-talk voice transcription daemon for Linux. Hotkey toggles recording, tra
 - `transcribe-daemon.py` — Main daemon. Loads model once, stays resident. Signal-based IPC (SIGUSR1/SIGUSR2) with client script.
 - `scripts/hotkey-wrapper.sh` — Client script bound to hotkey. Sends signals to daemon, starts daemon on first press.
 - `scripts/setup-hotkey.sh` — Configures hotkey binding for i3/sway/GNOME/KDE.
+- `whisper-status.py` — GTK3 floating status overlay. Polls `whisper-hotkey-status.json`, shows recording/transcribing/idle state. Launched automatically by daemon when `ENABLE_OVERLAY=true`.
 - `scripts/whisper.sh` — Legacy standalone transcription script.
 - `install.sh` — One-command installer (deps, venv, engine, GPU, hotkey, model download).
 
@@ -17,6 +18,7 @@ Push-to-talk voice transcription daemon for Linux. Hotkey toggles recording, tra
 - **Lazy daemon**: Starts on first hotkey press, optionally unloads after IDLE_TIMEOUT. Not a systemd service by default.
 - **Instant paste**: Uses `xdotool type --delay 0` (X11) or `ydotool key Ctrl+V` (Wayland) for pasting.
 - **Shift-to-submit**: Detects Shift key via X11 XQueryKeymap at paste time, presses Enter after paste. X11 only.
+- **Status overlay**: GTK3 widget spawned as a child process of the daemon. Reads `whisper-hotkey-status.json` (200ms poll). Auto-hides after 3s idle. Draggable. Killed when daemon exits.
 
 ## Engines
 
@@ -43,5 +45,5 @@ All config in `.env` (loaded via python-dotenv). See `.env.example` for all opti
 
 ## Dependencies
 
-System: pulseaudio-utils, xclip/wl-clipboard, xdotool/ydotool, libnotify-bin
+System: pulseaudio-utils, xclip/wl-clipboard, xdotool/ydotool, libnotify-bin, python3-gi (GTK3 for overlay)
 Python: see requirements.txt + onnx-asr[hub] for parakeet engine
