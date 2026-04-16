@@ -668,7 +668,7 @@ class AudioRecorderDaemon:
                 stderr=subprocess.DEVNULL
             )
             # Verify process actually started (short wait to detect immediate failure)
-            time.sleep(0.02)
+            time.sleep(0.005)
             if self.process.poll() is not None:
                 logger.error(f"parecord exited immediately with code {self.process.returncode}")
                 send_notification("Recording failed (parecord error)")
@@ -1155,8 +1155,9 @@ def main():
                 break
 
             # Wait for signals or timeout (efficient polling)
-            # 20ms gives snappy signal response without wasting CPU
-            shutdown_event.wait(timeout=0.02)
+            # 5ms gives near-instant signal response; ~200 wakeups/s is
+            # negligible on modern hardware for a long-running daemon.
+            shutdown_event.wait(timeout=0.005)
 
         logger.info("Daemon loop exiting")
 
