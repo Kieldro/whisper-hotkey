@@ -55,7 +55,7 @@ except ValueError:
     sys.exit(1)
 SAMPLE_RATE = 16000
 try:
-    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.2"))
+    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.5"))
 except ValueError:
     print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
     sys.exit(1)
@@ -302,8 +302,8 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
             update_status("idle")
             return None
 
-        # Trim with 0.1s padding
-        pad = int(0.1 * SAMPLE_RATE)
+        # Trim with 0.3s padding to preserve trailing consonants/words
+        pad = int(0.3 * SAMPLE_RATE)
         start = max(0, speech_timestamps[0]["start"] - pad)
         end = min(len(samples), speech_timestamps[-1]["end"] + pad)
 
@@ -662,6 +662,7 @@ class AudioRecorderDaemon:
                     '--format=s16le',
                     f'--rate={self.sample_rate}',
                     '--channels=1',
+                    '--latency-msec=30',
                     self.output_file
                 ],
                 stdout=subprocess.DEVNULL,
