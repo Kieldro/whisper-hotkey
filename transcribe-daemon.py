@@ -54,6 +54,7 @@ except ValueError:
     print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
     sys.exit(1)
 SAMPLE_RATE = 16000
+MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "300"))
 try:
     TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.5"))
 except ValueError:
@@ -638,6 +639,7 @@ class AudioRecorderDaemon:
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
         self.is_recording = False
+        self.recording_start_time: Optional[float] = None
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
 
@@ -687,6 +689,7 @@ class AudioRecorderDaemon:
             return False
 
         self.is_recording = True
+        self.recording_start_time = time.time()
         logger.info(f"Recording started, parecord PID: {self.process.pid}")
         play_sound(SOUND_START)
         send_notification("Recording...")
@@ -1148,6 +1151,19 @@ def main():
             if stop_recording_event.is_set():
                 stop_recording_event.clear()
                 logger.info("Received stop recording signal")
+                daemon.stop_and_process()
+
+            # Check for max recording duration
+            if (MAX_RECORDING_SECONDS > 0
+                    and daemon.recorder.is_recording
+                    and daemon.recorder.recording_start_time
+                    and time.time() - daemon.recorder.recording_start_time >= MAX_RECORDING_SECONDS):
+                logger.info(f"Max recording duration reached ({MAX_RECORDING_SECONDS}s), auto-stopping")
+                send_notification(f"Recording auto-stopped ({MAX_RECORDING_SECONDS}s limit)")
+                try:
+                    os.unlink(state_file)
+                except OSError:
+                    pass
                 daemon.stop_and_process()
 
             # Check for idle timeout
