@@ -54,7 +54,7 @@ except ValueError:
     print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
     sys.exit(1)
 SAMPLE_RATE = 16000
-MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "300"))
+MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "120"))
 try:
     TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.5"))
 except ValueError:
