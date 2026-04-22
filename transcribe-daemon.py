@@ -836,12 +836,19 @@ class AudioRecorderDaemon:
     def _stop_recording_macos(self) -> Optional[str]:
         """Stop sounddevice recording, close stream, write WAV file.
 
-        PortAudio's stop()/close() can hang indefinitely when CoreAudio state
-        shifts (device change, sleep/wake, buffer stall). A hang there blocks
-        the daemon forever — signal handlers can't fire while the main thread
-        is inside a native call. We run stop/close on a helper thread with a
-        timeout; if it hangs we salvage the queued audio and set
-        ``_portaudio_hung`` so main() can restart the process cleanly.
+        We call ``stream.abort()`` rather than ``stop()``: for input streams
+        on macOS, ``stop()`` asks the CoreAudio HAL to drain pending buffers
+        and can hang for seconds (or forever, on certain device-state
+        transitions). ``abort()`` is the hard-stop path — it just tells
+        PortAudio to stop invoking the callback, no HAL drain. The queued
+        audio we care about is already sitting in our own ``_audio_queue``.
+
+        If abort+close still takes longer than STREAM_STOP_TIMEOUT we assume
+        PortAudio is wedged, leak the stream object, and stay alive — the
+        next recording opens a fresh InputStream (with the existing
+        sleep/wake retry that reinits PortAudio on failure). The daemon
+        keeps running so the user isn't forced through another model
+        reload.
         """
         logger.info("Stopping recording (sounddevice)...")
         self.is_recording = False
@@ -858,21 +865,21 @@ class AudioRecorderDaemon:
 
             def _close_stream():
                 try:
-                    stream.stop()
-                    stream.close()
+                    stream.abort(ignore_errors=True)
+                    stream.close(ignore_errors=True)
                 except Exception as exc:
-                    logger.warning(f"stream stop/close raised: {exc}")
+                    logger.warning(f"stream abort/close raised: {exc}")
                 finally:
                     done.set()
 
             threading.Thread(target=_close_stream, daemon=True, name="sd-stop").start()
             if done.wait(timeout=STREAM_STOP_TIMEOUT):
-                logger.info(f"[stop:2-4/6] stream stop+close in {time.monotonic()-t0:.3f}s")
+                logger.info(f"[stop:2-4/6] stream abort+close in {time.monotonic()-t0:.3f}s")
             else:
                 self._portaudio_hung = True
-                logger.error(
-                    f"[stop:2-4/6] stream stop+close HUNG >{STREAM_STOP_TIMEOUT}s — "
-                    "salvaging audio; daemon will exit after processing"
+                logger.warning(
+                    f"[stop:2-4/6] stream abort+close HUNG >{STREAM_STOP_TIMEOUT}s — "
+                    "leaking stream; next recording will open a fresh one"
                 )
 
         # Drain queue (thread-safe even if the stream is zombied)
@@ -1284,18 +1291,24 @@ def main():
     # We now hold the lock
     logger.info(f"Acquired daemon lock, PID written to {daemon_lock_file}")
 
-    # Launch status overlay
+    # Launch status overlay — GTK on Linux, native AppKit on macOS.
+    # Use the same Python interpreter as the daemon (needed on macOS so the
+    # overlay picks up the venv's pyobjc; python3 on PATH won't have it).
     overlay_proc = None
     if ENABLE_OVERLAY:
-        overlay_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper-status.py")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        overlay_script = os.path.join(
+            script_dir,
+            "whisper-status-macos.py" if IS_MACOS else "whisper-status.py",
+        )
         if os.path.exists(overlay_script):
             try:
                 overlay_proc = subprocess.Popen(
-                    [shutil.which("python3") or "python3", overlay_script],
+                    [sys.executable, overlay_script],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                logger.info(f"Started status overlay (PID {overlay_proc.pid})")
+                logger.info(f"Started status overlay (PID {overlay_proc.pid}) from {os.path.basename(overlay_script)}")
             except Exception as e:
                 logger.warning(f"Failed to start status overlay: {e}")
 
@@ -1388,9 +1401,17 @@ def main():
                 logger.info("Received stop recording signal")
                 daemon.stop_and_process()
                 if getattr(daemon.recorder, "_portaudio_hung", False):
-                    logger.error("PortAudio hung during stop; exiting daemon so next hotkey press starts fresh")
-                    send_notification("⚠️ Audio system hung — restarting on next press")
-                    shutdown_event.set()
+                    # Stream is leaked but daemon stays alive. Reinit
+                    # PortAudio so the next sd.InputStream() gets a clean
+                    # handle; start_recording already retries on failure.
+                    try:
+                        import sounddevice as _sd
+                        _sd._terminate()
+                        _sd._initialize()
+                        logger.info("Reinitialized PortAudio after hung stop")
+                    except Exception as exc:
+                        logger.warning(f"PortAudio reinit failed: {exc}")
+                    daemon.recorder._portaudio_hung = False
 
             # Check for max recording duration
             if (MAX_RECORDING_SECONDS > 0
@@ -1405,9 +1426,14 @@ def main():
                     pass
                 daemon.stop_and_process()
                 if getattr(daemon.recorder, "_portaudio_hung", False):
-                    logger.error("PortAudio hung during stop; exiting daemon so next hotkey press starts fresh")
-                    send_notification("⚠️ Audio system hung — restarting on next press")
-                    shutdown_event.set()
+                    try:
+                        import sounddevice as _sd
+                        _sd._terminate()
+                        _sd._initialize()
+                        logger.info("Reinitialized PortAudio after hung stop")
+                    except Exception as exc:
+                        logger.warning(f"PortAudio reinit failed: {exc}")
+                    daemon.recorder._portaudio_hung = False
 
             # Check for idle timeout
             if daemon.is_idle_timeout_exceeded():
@@ -1451,11 +1477,6 @@ def main():
         except OSError:
             pass
         logger.info("=== Daemon exiting ===")
-        # If a PortAudio stop hung, its native threads can prevent a clean
-        # interpreter exit. Force-kill so the process actually dies.
-        if getattr(daemon.recorder, "_portaudio_hung", False):
-            logging.shutdown()
-            os._exit(1)
 
 
 if __name__ == "__main__":
