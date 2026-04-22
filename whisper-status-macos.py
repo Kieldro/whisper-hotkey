@@ -165,8 +165,12 @@ class StatusOverlay(NSObject):
             pulse.setAutoreverses_(True)
             pulse.setRepeatCount_(1e9)
             self.dot.layer().addAnimation_forKey_(pulse, "pulse")
-        self._reposition()
+        # Only reposition when the pill is becoming visible for a new
+        # lifecycle. Moving the cursor mid-recording shouldn't drag the
+        # pill across displays; it picks the "starting" screen and stays
+        # there until the next idle auto-hide cycle.
         if not self.window.isVisible():
+            self._reposition()
             self.window.orderFrontRegardless()
         if self.hide_timer is not None:
             self.hide_timer.invalidate()

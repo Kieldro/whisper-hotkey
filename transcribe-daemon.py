@@ -1247,23 +1247,32 @@ def main():
     # Launch status overlay — GTK on Linux, native AppKit on macOS.
     # Use the same Python interpreter as the daemon (needed on macOS so the
     # overlay picks up the venv's pyobjc; python3 on PATH won't have it).
-    overlay_proc = None
+    overlay_script = None
     if ENABLE_OVERLAY:
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        overlay_script = os.path.join(
+        candidate = os.path.join(
             script_dir,
             "whisper-status-macos.py" if IS_MACOS else "whisper-status.py",
         )
-        if os.path.exists(overlay_script):
-            try:
-                overlay_proc = subprocess.Popen(
-                    [sys.executable, overlay_script],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                logger.info(f"Started status overlay (PID {overlay_proc.pid}) from {os.path.basename(overlay_script)}")
-            except Exception as e:
-                logger.warning(f"Failed to start status overlay: {e}")
+        if os.path.exists(candidate):
+            overlay_script = candidate
+
+    def spawn_overlay():
+        if overlay_script is None:
+            return None
+        try:
+            p = subprocess.Popen(
+                [sys.executable, overlay_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info(f"Started status overlay (PID {p.pid}) from {os.path.basename(overlay_script)}")
+            return p
+        except Exception as e:
+            logger.warning(f"Failed to start status overlay: {e}")
+            return None
+
+    overlay_proc = spawn_overlay()
 
     # Signal handlers - use threading.Event for thread-safe signaling
     # NOTE: Signal handlers should only set flags, not call complex functions like logging
@@ -1366,6 +1375,12 @@ def main():
                 except OSError:
                     pass
                 daemon.stop_and_process()
+
+            # Keep the overlay alive: respawn if the user/test killed it.
+            if overlay_script and (overlay_proc is None or overlay_proc.poll() is not None):
+                if overlay_proc is not None:
+                    logger.warning(f"Status overlay exited (code {overlay_proc.returncode}); respawning")
+                overlay_proc = spawn_overlay()
 
             # Check for idle timeout
             if daemon.is_idle_timeout_exceeded():
