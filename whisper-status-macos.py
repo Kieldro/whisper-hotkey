@@ -14,9 +14,10 @@ from AppKit import (
     NSPanel, NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
     NSBackingStoreBuffered, NSScreenSaverWindowLevel,
     NSScreen, NSColor, NSTextField, NSFont,
-    NSTimer, NSTextAlignmentCenter, NSMakeRect,
+    NSTimer, NSTextAlignmentCenter, NSMakeRect, NSMakePoint,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSEvent,
 )
 from Foundation import NSObject
 from Quartz import CGColorCreateGenericRGB
@@ -29,12 +30,15 @@ STATUS_FILE = os.path.join(
 )
 
 # state -> (icon, label, (r, g, b), alpha)
+# Icons are monochrome Unicode symbols so they render white against the
+# colored pill background. The emoji equivalents (🔴 ⏸️ 📝 ⚙️ ⚠️) all force
+# their own colors and clash with the fill.
 STATE_CONFIG = {
-    "recording":    ("\U0001f534",   "REC",          (0.86, 0.15, 0.15), 0.92),
-    "processing":   ("⚙️", "Processing",   (0.85, 0.47, 0.02), 0.92),
-    "transcribing": ("\U0001f4dd",   "Transcribing", (0.15, 0.39, 0.92), 0.92),
-    "idle":         ("⏸️", "Idle",         (0.22, 0.25, 0.32), 0.85),
-    "error":        ("⚠️", "Error",        (0.50, 0.11, 0.11), 0.92),
+    "recording":    ("●", "REC",          (0.86, 0.15, 0.15), 0.92),
+    "processing":   ("◐", "Processing",   (0.85, 0.47, 0.02), 0.92),
+    "transcribing": ("✎", "Transcribing", (0.15, 0.39, 0.92), 0.92),
+    "idle":         ("·", "Idle",         (0.22, 0.25, 0.32), 0.85),
+    "error":        ("!", "Error",        (0.50, 0.11, 0.11), 0.92),
 }
 
 WIDTH = 220.0
@@ -51,14 +55,9 @@ class StatusOverlay(NSObject):
         if self is None:
             return None
 
-        screen = NSScreen.mainScreen().frame()
-        origin_x = screen.origin.x + screen.size.width - WIDTH - EDGE_MARGIN
-        origin_y = (screen.origin.y + screen.size.height
-                    - HEIGHT - EDGE_MARGIN - MENU_BAR_CLEARANCE)
-
         mask = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
         self.window = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(origin_x, origin_y, WIDTH, HEIGHT),
+            NSMakeRect(0, 0, WIDTH, HEIGHT),
             mask, NSBackingStoreBuffered, False,
         )
         self.window.setLevel_(NSScreenSaverWindowLevel)
@@ -113,6 +112,7 @@ class StatusOverlay(NSObject):
         icon, label, (r, g, b), a = STATE_CONFIG.get(state, STATE_CONFIG["idle"])
         self.label.setStringValue_(f"{icon}  {label}")
         self.label.layer().setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, a))
+        self._reposition()
         if not self.window.isVisible():
             self.window.orderFrontRegardless()
         if self.hide_timer is not None:
@@ -122,6 +122,29 @@ class StatusOverlay(NSObject):
             self.hide_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 3.0, self, "autoHide:", None, False,
             )
+
+    @objc.python_method
+    def _reposition(self):
+        """Put the pill in the top-right of the screen the mouse is on.
+
+        NSScreen.mainScreen() is unreliable in a headless LSUIElement
+        process — with multiple monitors it can return any of them. The
+        mouse cursor is a stable "where the user is looking" heuristic.
+        """
+        mouse = NSEvent.mouseLocation()
+        target = None
+        for s in NSScreen.screens():
+            f = s.frame()
+            if (f.origin.x <= mouse.x < f.origin.x + f.size.width
+                    and f.origin.y <= mouse.y < f.origin.y + f.size.height):
+                target = s
+                break
+        if target is None:
+            target = NSScreen.mainScreen()
+        f = target.frame()
+        x = f.origin.x + f.size.width - WIDTH - EDGE_MARGIN
+        y = f.origin.y + f.size.height - HEIGHT - EDGE_MARGIN - MENU_BAR_CLEARANCE
+        self.window.setFrameOrigin_(NSMakePoint(x, y))
 
 
 # objc needs explicit selector signatures for methods called via NSTimer/target
