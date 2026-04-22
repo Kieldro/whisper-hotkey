@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Floating status overlay for whisper-hotkey on macOS (AppKit / pyobjc).
 
-Watches whisper-hotkey-status.json and shows a compact HUD pill in the
-top-right corner of whichever screen the mouse cursor is on. Uses
-NSVisualEffectView for native blur and a small colored state dot, so it
-feels like a built-in macOS element (Menu Bar extra, Notification Center
-card) rather than a homemade colored box.
+A small HUD pill in the top-right of the screen the cursor is on.
+The pill fill is a native blur (NSVisualEffectView) with a translucent
+color tint on top, so recording reads red-at-a-glance, transcribing
+reads blue, etc. — without looking like a painted solid color. A
+prominent colored dot reinforces the state; during active recording
+the dot pulses.
 """
 import json
 import os
@@ -15,7 +16,7 @@ from AppKit import (
     NSPanel, NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
     NSBackingStoreBuffered, NSScreenSaverWindowLevel,
     NSScreen, NSColor, NSTextField, NSFont, NSFontWeightSemibold,
-    NSTimer, NSTextAlignmentLeft, NSMakeRect, NSMakePoint, NSMakeSize,
+    NSTimer, NSTextAlignmentLeft, NSMakeRect, NSMakePoint,
     NSView, NSVisualEffectView,
     NSVisualEffectMaterialHUDWindow,
     NSVisualEffectBlendingModeBehindWindow,
@@ -26,7 +27,8 @@ from AppKit import (
     NSViewWidthSizable, NSViewHeightSizable,
 )
 from Foundation import NSObject
-from Quartz import CGColorCreateGenericRGB
+from Quartz import CGColorCreateGenericRGB, CABasicAnimation
+from Foundation import NSNumber
 import objc
 
 
@@ -35,22 +37,22 @@ STATUS_FILE = os.path.join(
     "whisper-hotkey-status.json",
 )
 
-# state -> (label, dot RGBA)
+# state -> (label, color rgb, tint alpha)
 STATE_CONFIG = {
-    "recording":    ("Recording",    (0.92, 0.25, 0.27, 1.0)),
-    "processing":   ("Processing",   (0.95, 0.58, 0.12, 1.0)),
-    "transcribing": ("Transcribing", (0.27, 0.52, 0.96, 1.0)),
-    "idle":         ("Idle",         (0.55, 0.58, 0.62, 1.0)),
-    "error":        ("Error",        (0.87, 0.22, 0.22, 1.0)),
+    "recording":    ("Recording",    (0.98, 0.28, 0.30), 0.55),
+    "processing":   ("Processing",   (0.98, 0.62, 0.15), 0.50),
+    "transcribing": ("Transcribing", (0.30, 0.58, 1.00), 0.50),
+    "idle":         ("Idle",         (0.62, 0.66, 0.72), 0.25),
+    "error":        ("Error",        (0.92, 0.30, 0.30), 0.60),
 }
 
-# Visual constants
-WIDTH = 168.0
-HEIGHT = 30.0
-CORNER_RADIUS = 14.0
-DOT_SIZE = 8.0
+WIDTH = 164.0
+HEIGHT = 34.0
+CORNER_RADIUS = HEIGHT / 2     # true capsule
+DOT_SIZE = 12.0
 DOT_LEFT = 12.0
-LABEL_LEFT = DOT_LEFT + DOT_SIZE + 8.0
+LABEL_LEFT = DOT_LEFT + DOT_SIZE + 10.0
+LABEL_RIGHT_PAD = 14.0
 EDGE_MARGIN = 14.0
 MENU_BAR_CLEARANCE = 28.0
 
@@ -78,9 +80,7 @@ class StatusOverlay(NSObject):
             | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
 
-        # HUD-material visual effect view fills the window with a native
-        # translucent blur. We mask it to a rounded rect so it becomes a
-        # proper capsule pill instead of a sharp-edged rectangle.
+        # Layer 1: native blur/material
         blur = NSVisualEffectView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WIDTH, HEIGHT))
         blur.setMaterial_(NSVisualEffectMaterialHUDWindow)
@@ -91,9 +91,19 @@ class StatusOverlay(NSObject):
         blur.layer().setMasksToBounds_(True)
         blur.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         self.window.setContentView_(blur)
-        self.blur = blur
 
-        # Small colored dot that communicates state without an icon font.
+        # Layer 2: colored tint on top of the blur (this is what makes the
+        # whole pill feel red/blue/orange at a glance, without looking like
+        # a flat painted rect).
+        self.tint = NSView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, WIDTH, HEIGHT))
+        self.tint.setWantsLayer_(True)
+        self.tint.layer().setCornerRadius_(CORNER_RADIUS)
+        self.tint.layer().setMasksToBounds_(True)
+        self.tint.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        blur.addSubview_(self.tint)
+
+        # Layer 3: state dot
         dot_y = (HEIGHT - DOT_SIZE) / 2
         self.dot = NSView.alloc().initWithFrame_(
             NSMakeRect(DOT_LEFT, dot_y, DOT_SIZE, DOT_SIZE))
@@ -101,16 +111,17 @@ class StatusOverlay(NSObject):
         self.dot.layer().setCornerRadius_(DOT_SIZE / 2)
         blur.addSubview_(self.dot)
 
-        # Label: SF Pro semibold, clean left-aligned.
-        label_rect = NSMakeRect(LABEL_LEFT, 0, WIDTH - LABEL_LEFT - 12, HEIGHT)
+        # Layer 4: label
+        label_rect = NSMakeRect(
+            LABEL_LEFT, 0, WIDTH - LABEL_LEFT - LABEL_RIGHT_PAD, HEIGHT)
         self.label = NSTextField.alloc().initWithFrame_(label_rect)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
         self.label.setEditable_(False)
         self.label.setSelectable_(False)
         self.label.setAlignment_(NSTextAlignmentLeft)
-        self.label.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
-        self.label.setTextColor_(NSColor.labelColor())
+        self.label.setFont_(NSFont.systemFontOfSize_weight_(13.5, NSFontWeightSemibold))
+        self.label.setTextColor_(NSColor.whiteColor())
         self.label.setStringValue_("")
         blur.addSubview_(self.label)
 
@@ -139,9 +150,21 @@ class StatusOverlay(NSObject):
             if self.window.isVisible():
                 self.window.orderOut_(None)
             return
-        label, (r, g, b, a) = STATE_CONFIG.get(state, STATE_CONFIG["idle"])
+        label, (r, g, b), tint_alpha = STATE_CONFIG.get(state, STATE_CONFIG["idle"])
         self.label.setStringValue_(label)
-        self.dot.layer().setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, a))
+        self.tint.layer().setBackgroundColor_(
+            CGColorCreateGenericRGB(r, g, b, tint_alpha))
+        self.dot.layer().setBackgroundColor_(
+            CGColorCreateGenericRGB(r, g, b, 1.0))
+        self.dot.layer().removeAllAnimations()
+        if state == "recording":
+            pulse = CABasicAnimation.animationWithKeyPath_("opacity")
+            pulse.setFromValue_(NSNumber.numberWithDouble_(1.0))
+            pulse.setToValue_(NSNumber.numberWithDouble_(0.35))
+            pulse.setDuration_(0.9)
+            pulse.setAutoreverses_(True)
+            pulse.setRepeatCount_(1e9)
+            self.dot.layer().addAnimation_forKey_(pulse, "pulse")
         self._reposition()
         if not self.window.isVisible():
             self.window.orderFrontRegardless()
