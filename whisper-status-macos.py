@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """Floating status overlay for whisper-hotkey on macOS (AppKit / pyobjc).
 
-Watches whisper-hotkey-status.json and shows a small rounded pill in the
-top-right corner with the current recording/transcribing/idle state.
-Auto-hides 3 s after returning to idle. Drag by the pill body to move.
+Watches whisper-hotkey-status.json and shows a compact HUD pill in the
+top-right corner of whichever screen the mouse cursor is on. Uses
+NSVisualEffectView for native blur and a small colored state dot, so it
+feels like a built-in macOS element (Menu Bar extra, Notification Center
+card) rather than a homemade colored box.
 """
 import json
 import os
-import sys
 
 from AppKit import (
     NSApplication, NSApplicationActivationPolicyAccessory,
     NSPanel, NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
     NSBackingStoreBuffered, NSScreenSaverWindowLevel,
-    NSScreen, NSColor, NSTextField, NSFont,
-    NSTimer, NSTextAlignmentCenter, NSMakeRect, NSMakePoint,
+    NSScreen, NSColor, NSTextField, NSFont, NSFontWeightSemibold,
+    NSTimer, NSTextAlignmentLeft, NSMakeRect, NSMakePoint, NSMakeSize,
+    NSView, NSVisualEffectView,
+    NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectBlendingModeBehindWindow,
+    NSVisualEffectStateActive,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSEvent,
+    NSViewWidthSizable, NSViewHeightSizable,
 )
 from Foundation import NSObject
 from Quartz import CGColorCreateGenericRGB
@@ -29,26 +35,28 @@ STATUS_FILE = os.path.join(
     "whisper-hotkey-status.json",
 )
 
-# state -> (icon, label, (r, g, b), alpha)
-# Icons are monochrome Unicode symbols so they render white against the
-# colored pill background. The emoji equivalents (🔴 ⏸️ 📝 ⚙️ ⚠️) all force
-# their own colors and clash with the fill.
+# state -> (label, dot RGBA)
 STATE_CONFIG = {
-    "recording":    ("●", "REC",          (0.86, 0.15, 0.15), 0.92),
-    "processing":   ("◐", "Processing",   (0.85, 0.47, 0.02), 0.92),
-    "transcribing": ("✎", "Transcribing", (0.15, 0.39, 0.92), 0.92),
-    "idle":         ("·", "Idle",         (0.22, 0.25, 0.32), 0.85),
-    "error":        ("!", "Error",        (0.50, 0.11, 0.11), 0.92),
+    "recording":    ("Recording",    (0.92, 0.25, 0.27, 1.0)),
+    "processing":   ("Processing",   (0.95, 0.58, 0.12, 1.0)),
+    "transcribing": ("Transcribing", (0.27, 0.52, 0.96, 1.0)),
+    "idle":         ("Idle",         (0.55, 0.58, 0.62, 1.0)),
+    "error":        ("Error",        (0.87, 0.22, 0.22, 1.0)),
 }
 
-WIDTH = 220.0
-HEIGHT = 44.0
-EDGE_MARGIN = 16.0
-MENU_BAR_CLEARANCE = 24.0
+# Visual constants
+WIDTH = 168.0
+HEIGHT = 30.0
+CORNER_RADIUS = 14.0
+DOT_SIZE = 8.0
+DOT_LEFT = 12.0
+LABEL_LEFT = DOT_LEFT + DOT_SIZE + 8.0
+EDGE_MARGIN = 14.0
+MENU_BAR_CLEARANCE = 28.0
 
 
 class StatusOverlay(NSObject):
-    """Owns the panel and polls the status file on a timer."""
+    """Owns the HUD panel and polls the status file on a timer."""
 
     def init(self):
         self = objc.super(StatusOverlay, self).init()
@@ -70,19 +78,41 @@ class StatusOverlay(NSObject):
             | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
 
-        self.label = NSTextField.alloc().initWithFrame_(
+        # HUD-material visual effect view fills the window with a native
+        # translucent blur. We mask it to a rounded rect so it becomes a
+        # proper capsule pill instead of a sharp-edged rectangle.
+        blur = NSVisualEffectView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WIDTH, HEIGHT))
+        blur.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        blur.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+        blur.setState_(NSVisualEffectStateActive)
+        blur.setWantsLayer_(True)
+        blur.layer().setCornerRadius_(CORNER_RADIUS)
+        blur.layer().setMasksToBounds_(True)
+        blur.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+        self.window.setContentView_(blur)
+        self.blur = blur
+
+        # Small colored dot that communicates state without an icon font.
+        dot_y = (HEIGHT - DOT_SIZE) / 2
+        self.dot = NSView.alloc().initWithFrame_(
+            NSMakeRect(DOT_LEFT, dot_y, DOT_SIZE, DOT_SIZE))
+        self.dot.setWantsLayer_(True)
+        self.dot.layer().setCornerRadius_(DOT_SIZE / 2)
+        blur.addSubview_(self.dot)
+
+        # Label: SF Pro semibold, clean left-aligned.
+        label_rect = NSMakeRect(LABEL_LEFT, 0, WIDTH - LABEL_LEFT - 12, HEIGHT)
+        self.label = NSTextField.alloc().initWithFrame_(label_rect)
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
         self.label.setEditable_(False)
         self.label.setSelectable_(False)
-        self.label.setAlignment_(NSTextAlignmentCenter)
-        self.label.setFont_(NSFont.boldSystemFontOfSize_(18))
-        self.label.setTextColor_(NSColor.whiteColor())
-        self.label.setWantsLayer_(True)
-        self.label.layer().setCornerRadius_(12.0)
-        self.label.layer().setMasksToBounds_(True)
-        self.window.setContentView_(self.label)
+        self.label.setAlignment_(NSTextAlignmentLeft)
+        self.label.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
+        self.label.setTextColor_(NSColor.labelColor())
+        self.label.setStringValue_("")
+        blur.addSubview_(self.label)
 
         self.current_state = None
         self.hide_timer = None
@@ -109,9 +139,9 @@ class StatusOverlay(NSObject):
             if self.window.isVisible():
                 self.window.orderOut_(None)
             return
-        icon, label, (r, g, b), a = STATE_CONFIG.get(state, STATE_CONFIG["idle"])
-        self.label.setStringValue_(f"{icon}  {label}")
-        self.label.layer().setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, a))
+        label, (r, g, b, a) = STATE_CONFIG.get(state, STATE_CONFIG["idle"])
+        self.label.setStringValue_(label)
+        self.dot.layer().setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, a))
         self._reposition()
         if not self.window.isVisible():
             self.window.orderFrontRegardless()
