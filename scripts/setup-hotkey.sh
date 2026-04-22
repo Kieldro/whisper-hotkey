@@ -20,38 +20,39 @@ if [ ! -f "$VENV_PYTHON" ]; then
     exit 1
 fi
 
-# --- macOS: use Hammerspoon ---
+# --- macOS: use skhd ---
 if [ "$OS_TYPE" = "Darwin" ]; then
-    HS_CONFIG="$HOME/.hammerspoon/init.lua"
-    mkdir -p "$(dirname "$HS_CONFIG")"
+    SKHD_CONFIG="$HOME/.config/skhd/skhdrc"
+    mkdir -p "$(dirname "$SKHD_CONFIG")"
 
-    echo "📝 macOS setup using Hammerspoon:"
+    echo "📝 macOS setup using skhd:"
     echo "Hotkey: Option+Space (press once to start, again to stop)"
     echo ""
 
-    if grep -q "whisper-hotkey" "$HS_CONFIG" 2>/dev/null; then
-        echo "⚠️  Hotkey already exists in Hammerspoon config"
-    else
-        cat >> "$HS_CONFIG" << LUAEOF
-
--- Whisper Hotkey: Option+Space → toggle push-to-talk transcription
-local wrapper = "$WRAPPER_SCRIPT"
-hs.hotkey.bind({"alt"}, "space", function()
-    hs.task.new(wrapper, nil):start()
-end)
-LUAEOF
-        echo "✅ Added to $HS_CONFIG"
+    if ! command -v skhd >/dev/null 2>&1; then
+        if command -v brew >/dev/null 2>&1; then
+            echo "📦 Installing skhd via Homebrew..."
+            brew install skhd
+        else
+            echo "❌ Homebrew not found. Install from https://brew.sh then rerun."
+            exit 1
+        fi
     fi
 
-    if [ -d "/Applications/Hammerspoon.app" ]; then
-        open /Applications/Hammerspoon.app
-        echo "✅ Hammerspoon launched — reload config with Cmd+Shift+R in the Hammerspoon console"
+    BINDING="alt - space : $WRAPPER_SCRIPT"
+    if grep -Fq "$WRAPPER_SCRIPT" "$SKHD_CONFIG" 2>/dev/null; then
+        echo "⚠️  Hotkey already exists in $SKHD_CONFIG"
     else
-        echo "⚠️  Hammerspoon not installed. Run: brew install --cask hammerspoon"
+        echo "$BINDING" >> "$SKHD_CONFIG"
+        echo "✅ Added binding to $SKHD_CONFIG"
     fi
+
+    brew services restart skhd >/dev/null
+    echo "✅ skhd service started"
 
     echo ""
-    echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add Hammerspoon"
+    echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add skhd"
+    echo "    (first hotkey press will prompt if missing)"
     echo ""
     echo "✅ Setup complete!"
     exit 0

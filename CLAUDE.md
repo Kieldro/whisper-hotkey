@@ -1,23 +1,23 @@
 # Whisper Hotkey
 
-Push-to-talk voice transcription daemon for Linux. Hotkey toggles recording, transcribes locally via Parakeet TDT or faster-whisper, pastes text into active window.
+Push-to-talk voice transcription daemon for macOS and Linux. Hotkey toggles recording, transcribes locally via Parakeet TDT or faster-whisper, pastes text into active window.
 
 ## Architecture
 
 - `transcribe-daemon.py` — Main daemon. Loads model once, stays resident. Signal-based IPC (SIGUSR1/SIGUSR2) with client script.
 - `scripts/hotkey-wrapper.sh` — Client script bound to hotkey. Sends signals to daemon, starts daemon on first press.
-- `scripts/setup-hotkey.sh` — Configures hotkey binding for i3/sway/GNOME/KDE.
+- `scripts/setup-hotkey.sh` — Configures hotkey binding. macOS: installs skhd + writes `~/.config/skhd/skhdrc`. Linux: i3/sway/GNOME/KDE.
 - `whisper-status.py` — GTK3 floating status overlay. Polls `whisper-hotkey-status.json`, shows recording/transcribing/idle state. Launched automatically by daemon when `ENABLE_OVERLAY=true`.
 - `scripts/whisper.sh` — Legacy standalone transcription script.
 - `install.sh` — One-command installer (deps, venv, engine, GPU, hotkey, model download).
 
 ## Key Design Decisions
 
-- **State file toggle**: `$XDG_RUNTIME_DIR/whisper-hotkey-state` exists = recording. Hotkey wrapper creates/removes it.
+- **State file toggle**: `whisper-hotkey-state` in runtime dir (`$XDG_RUNTIME_DIR` on Linux, `$TMPDIR` on macOS) exists = recording. Hotkey wrapper creates/removes it.
 - **Auto-start on first press**: Daemon creates state file before model load, plays wind chime during load, auto-starts recording when ready. Clears queued signals after load to avoid race conditions.
 - **Lazy daemon**: Starts on first hotkey press, optionally unloads after IDLE_TIMEOUT. Not a systemd service by default.
-- **Instant paste**: Uses `xdotool type --delay 0` (X11) or `ydotool key Ctrl+V` (Wayland) for pasting.
-- **Shift-to-submit**: Detects Shift key via X11 XQueryKeymap at paste time, presses Enter after paste. X11 only.
+- **Instant paste**: Uses CGEvent Cmd+V (macOS), `xdotool type --delay 0` (X11), or `ydotool key Ctrl+V` (Wayland).
+- **Shift-to-submit**: Detects Shift at paste time via Quartz/CGEvent (macOS) or X11 XQueryKeymap (Linux X11); presses Enter after paste. Wayland not supported.
 - **Status overlay**: GTK3 widget spawned as a child process of the daemon. Reads `whisper-hotkey-status.json` (200ms poll). Auto-hides after 3s idle. Draggable. Killed when daemon exits.
 
 ## Engines
@@ -32,8 +32,9 @@ All config in `.env` (loaded via python-dotenv). See `.env.example` for all opti
 ## Testing
 
 - Kill daemon: `pkill -f transcribe-daemon`
-- Check logs: `tail -f $XDG_RUNTIME_DIR/whisper-hotkey.log`
-- Test recording: `parecord --format=s16le --rate=16000 --channels=1 test.wav`
+- Check logs: `tail -f "${XDG_RUNTIME_DIR:-$TMPDIR}/whisper-hotkey.log"`
+- Test recording (Linux): `parecord --format=s16le --rate=16000 --channels=1 test.wav`
+- Test recording (macOS): use the daemon directly; sounddevice/PortAudio handles input
 - Check daemon status: `ps aux | grep transcribe-daemon`
 
 ## Known Limitations
@@ -45,5 +46,6 @@ All config in `.env` (loaded via python-dotenv). See `.env.example` for all opti
 
 ## Dependencies
 
-System: pulseaudio-utils, xclip/wl-clipboard, xdotool/ydotool, libnotify-bin, python3-gi (GTK3 for overlay)
+Linux system: pulseaudio-utils, xclip/wl-clipboard, xdotool/ydotool, libnotify-bin, python3-gi (GTK3 for overlay)
+macOS system: skhd (brew), `pbcopy`/`osascript` built-in, sounddevice via PortAudio (`brew install portaudio`)
 Python: see requirements.txt + onnx-asr[hub] for parakeet engine

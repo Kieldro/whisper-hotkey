@@ -21,7 +21,7 @@ The model stays loaded in memory so subsequent uses are instant.
 - **Shift-to-submit** — hold Shift when pressing stop to press Enter after paste (great for chat apps)
 - **Optional GPT polishing** — clean up grammar/formatting via OpenAI API
 - **Works offline** — no internet required in default mode
-- **Cross-platform** — macOS (Hammerspoon) and Linux (X11/Wayland)
+- **Cross-platform** — macOS (skhd) and Linux (X11/Wayland)
 
 ## Quick Start
 
@@ -40,13 +40,14 @@ The installer auto-detects your OS and handles dependencies, Python environment,
 **Requirements:** macOS 10.15+, Python 3.11+, [Homebrew](https://brew.sh)
 
 **What the installer does:**
-- Installs [Hammerspoon](https://www.hammerspoon.org/) via Homebrew
+- Installs [skhd](https://github.com/koekeishiya/skhd) via Homebrew
 - Installs Python deps: sounddevice, soundfile, numpy, faster-whisper
-- Configures Option+Space hotkey in `~/.hammerspoon/init.lua`
+- Configures Option+Space hotkey in `~/.config/skhd/skhdrc`
+- Starts the skhd launchd service (`brew services start skhd`)
 - Offers MPS acceleration on Apple Silicon
 
 **After install — grant Accessibility permission:**
-System Settings > Privacy & Security > Accessibility > add Hammerspoon
+System Settings > Privacy & Security > Accessibility > add skhd
 
 **Default engine:** faster-whisper with `tiny` model and `int8` compute — ~0.9s transcription for 5s of speech.
 
@@ -161,13 +162,13 @@ The daemon (`transcribe-daemon.py`) loads the model once and stays resident (con
 
 **No audio detected (Linux)** — test your mic: `parecord --format=s16le --rate=16000 --channels=1 test.wav`, speak, Ctrl+C, then `paplay test.wav`.
 
-**Not pasting (macOS)** — ensure Hammerspoon has Accessibility permission in System Settings > Privacy & Security > Accessibility.
+**Not pasting (macOS)** — ensure skhd has Accessibility permission in System Settings > Privacy & Security > Accessibility.
 
 **Not pasting (Linux)** — make sure `xdotool` (X11) or `ydotool` (Wayland) is installed and working.
 
 **Model download fails** — models download on first run. Check your internet connection and try running the daemon manually to see errors.
 
-**Hotkey not working (macOS)** — open the Hammerspoon console (click menu bar icon) and reload config with Cmd+Shift+R.
+**Hotkey not working (macOS)** — verify skhd is running (`brew services list | grep skhd`). Restart with `brew services restart skhd`. Check the binding exists in `~/.config/skhd/skhdrc`.
 
 ## License
 
