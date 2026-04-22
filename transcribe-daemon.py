@@ -1400,17 +1400,13 @@ def main():
                 stop_recording_event.clear()
                 logger.info("Received stop recording signal")
                 daemon.stop_and_process()
+                # Intentionally no PortAudio reinit here: if abort() is
+                # still stuck in the sd-stop helper thread it holds the
+                # PortAudio internal mutex, and calling Pa_Terminate on
+                # the main thread deadlocks waiting for it. The next
+                # start_recording has its own retry path that reinits on
+                # InputStream failure, which is the safer moment to do it.
                 if getattr(daemon.recorder, "_portaudio_hung", False):
-                    # Stream is leaked but daemon stays alive. Reinit
-                    # PortAudio so the next sd.InputStream() gets a clean
-                    # handle; start_recording already retries on failure.
-                    try:
-                        import sounddevice as _sd
-                        _sd._terminate()
-                        _sd._initialize()
-                        logger.info("Reinitialized PortAudio after hung stop")
-                    except Exception as exc:
-                        logger.warning(f"PortAudio reinit failed: {exc}")
                     daemon.recorder._portaudio_hung = False
 
             # Check for max recording duration
