@@ -62,11 +62,6 @@ try:
 except ValueError:
     print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
     sys.exit(1)
-try:
-    STREAM_STOP_TIMEOUT = float(os.getenv("STREAM_STOP_TIMEOUT", "3.0"))
-except ValueError:
-    print(f"Error: STREAM_STOP_TIMEOUT='{os.getenv('STREAM_STOP_TIMEOUT')}' is not a valid number", file=sys.stderr)
-    sys.exit(1)
 
 # Feature configs
 ENABLE_VAD = os.getenv("ENABLE_VAD", "true").lower() == "true"
@@ -694,7 +689,7 @@ def paste_text(text: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 class AudioRecorderDaemon:
-    """Non-blocking audio recorder. Uses sounddevice on macOS, parecord on Linux."""
+    """Non-blocking audio recorder. AVAudioRecorder on macOS, parecord on Linux."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
@@ -702,8 +697,7 @@ class AudioRecorderDaemon:
         self.recording_start_time: Optional[float] = None
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
-        self._sd_stream = None
-        self._audio_queue = None
+        self._av_recorder = None
 
     def start_recording(self) -> bool:
         """Start recording. Returns True on success."""
@@ -715,57 +709,61 @@ class AudioRecorderDaemon:
         return self._start_recording_linux()
 
     def _start_recording_macos(self) -> bool:
-        """Record audio using sounddevice (macOS CoreAudio)."""
-        import queue as _queue
+        """Record audio via AVAudioRecorder (native macOS; sidesteps
+        PortAudio, whose abort()/stop() path can hang indefinitely on
+        CoreAudio HAL state transitions)."""
         try:
-            import sounddevice as sd
+            from AVFoundation import AVAudioRecorder
+            from Foundation import NSURL
         except ImportError:
-            logger.error("sounddevice not installed. Run: pip install sounddevice soundfile numpy")
-            send_notification("❌ sounddevice not installed")
+            logger.error("AVFoundation not available. Run: pip install pyobjc-framework-AVFoundation")
+            send_notification("❌ AVFoundation missing")
             return False
 
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         self.output_file = temp_file.name
         temp_file.close()
+        # AVAudioRecorder refuses to overwrite an existing file via this init.
+        try:
+            os.unlink(self.output_file)
+        except OSError:
+            pass
         logger.info(f"Created temp audio file: {self.output_file}")
 
-        self._audio_queue = _queue.Queue()
+        # kAudioFormatLinearPCM = 'lpcm' FourCC as big-endian uint32
+        settings = {
+            "AVFormatIDKey": 0x6C70636D,
+            "AVSampleRateKey": float(self.sample_rate),
+            "AVNumberOfChannelsKey": 1,
+            "AVLinearPCMBitDepthKey": 16,
+            "AVLinearPCMIsFloatKey": False,
+            "AVLinearPCMIsBigEndianKey": False,
+        }
+        url = NSURL.fileURLWithPath_(self.output_file)
+        recorder, err = AVAudioRecorder.alloc().initWithURL_settings_error_(url, settings, None)
+        if recorder is None:
+            logger.error(f"AVAudioRecorder init failed: {err}")
+            send_notification("❌ Recording init failed")
+            self._cleanup_temp_files()
+            return False
+        if not recorder.prepareToRecord():
+            logger.error("AVAudioRecorder prepareToRecord returned False (mic permission?)")
+            send_notification("❌ Mic permission needed for skhd in System Settings")
+            self._cleanup_temp_files()
+            return False
+        if not recorder.record():
+            logger.error("AVAudioRecorder record returned False")
+            send_notification("❌ Recording failed to start")
+            self._cleanup_temp_files()
+            return False
 
-        def callback(indata, frames, time, status):
-            if status:
-                logger.warning(f"Audio status: {status}")
-            self._audio_queue.put(indata.copy())
-
-        for attempt in range(2):
-            try:
-                self._sd_stream = sd.InputStream(
-                    samplerate=self.sample_rate,
-                    channels=1,
-                    dtype='int16',
-                    callback=callback
-                )
-                self._sd_stream.start()
-                break
-            except Exception as e:
-                if attempt == 0:
-                    # PortAudio handle may be stale after sleep/wake — reinit and retry
-                    logger.warning(f"Audio open failed ({e}), reinitializing PortAudio...")
-                    try:
-                        sd._terminate()
-                        sd._initialize()
-                    except Exception:
-                        pass
-                    time.sleep(0.3)
-                else:
-                    logger.error(f"Failed to start sounddevice after retry: {e}")
-                    send_notification(f"❌ Recording failed: {str(e)[:30]}")
-                    self._cleanup_temp_files()
-                    return False
-
+        self._av_recorder = recorder
         self.is_recording = True
-        logger.info("Recording started (sounddevice/CoreAudio)")
+        self.recording_start_time = time.time()
+        logger.info("Recording started (AVAudioRecorder)")
         play_sound(SOUND_START)
         send_notification("🎤 Recording...")
+        update_status("recording")
         return True
 
     def _start_recording_linux(self) -> bool:
@@ -834,79 +832,34 @@ class AudioRecorderDaemon:
         return self._stop_recording_linux()
 
     def _stop_recording_macos(self) -> Optional[str]:
-        """Stop sounddevice recording, close stream, write WAV file.
+        """Stop AVAudioRecorder and return the written WAV path.
 
-        We call ``stream.abort()`` rather than ``stop()``: for input streams
-        on macOS, ``stop()`` asks the CoreAudio HAL to drain pending buffers
-        and can hang for seconds (or forever, on certain device-state
-        transitions). ``abort()`` is the hard-stop path — it just tells
-        PortAudio to stop invoking the callback, no HAL drain. The queued
-        audio we care about is already sitting in our own ``_audio_queue``.
-
-        If abort+close still takes longer than STREAM_STOP_TIMEOUT we assume
-        PortAudio is wedged, leak the stream object, and stay alive — the
-        next recording opens a fresh InputStream (with the existing
-        sleep/wake retry that reinits PortAudio on failure). The daemon
-        keeps running so the user isn't forced through another model
-        reload.
+        AVAudioRecorder.stop() is documented as synchronous and finalizes
+        the file on return — typically < 10 ms. No watchdog needed.
         """
-        logger.info("Stopping recording (sounddevice)...")
+        logger.info("Stopping recording (AVAudioRecorder)...")
         self.is_recording = False
 
-        logger.info(f"[stop:1/6] trailing sleep {TRAILING_SPEECH_DELAY}s")
         time.sleep(TRAILING_SPEECH_DELAY)
 
-        stream = self._sd_stream
-        self._sd_stream = None
-        self._portaudio_hung = False
-        if stream is not None:
-            done = threading.Event()
+        if self._av_recorder is not None:
             t0 = time.monotonic()
+            try:
+                self._av_recorder.stop()
+            except Exception as exc:
+                logger.warning(f"AVAudioRecorder.stop() raised: {exc}")
+            logger.info(f"AVAudioRecorder stopped in {time.monotonic()-t0:.3f}s")
+            self._av_recorder = None
 
-            def _close_stream():
-                try:
-                    stream.abort(ignore_errors=True)
-                    stream.close(ignore_errors=True)
-                except Exception as exc:
-                    logger.warning(f"stream abort/close raised: {exc}")
-                finally:
-                    done.set()
-
-            threading.Thread(target=_close_stream, daemon=True, name="sd-stop").start()
-            if done.wait(timeout=STREAM_STOP_TIMEOUT):
-                logger.info(f"[stop:2-4/6] stream abort+close in {time.monotonic()-t0:.3f}s")
-            else:
-                self._portaudio_hung = True
-                logger.warning(
-                    f"[stop:2-4/6] stream abort+close HUNG >{STREAM_STOP_TIMEOUT}s — "
-                    "leaking stream; next recording will open a fresh one"
-                )
-
-        # Drain queue (thread-safe even if the stream is zombied)
-        qsize = self._audio_queue.qsize() if self._audio_queue else 0
-        logger.info(f"[stop:5/6] draining audio queue ({qsize} items)")
-        frames = []
-        while self._audio_queue and not self._audio_queue.empty():
-            frames.append(self._audio_queue.get())
-
-        if not frames:
-            logger.error("No audio recorded (empty queue)")
-            return None
-
-        try:
-            import numpy as np
-            import soundfile as sf
-            audio_data = np.concatenate(frames, axis=0)
-            logger.info(f"[stop:6/6] writing WAV ({audio_data.shape[0]} samples)")
-            sf.write(self.output_file, audio_data, self.sample_rate, subtype='PCM_16')
-        except ImportError as e:
-            logger.error(f"Missing dependency: {e}. Run: pip install sounddevice soundfile numpy")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to write audio file: {e}")
+        if not self.output_file or not os.path.exists(self.output_file):
+            logger.error(f"Recording file missing: {self.output_file}")
             return None
 
         file_size = os.path.getsize(self.output_file)
+        if file_size == 0:
+            logger.error("Recording file is empty")
+            return None
+
         logger.info(f"Final audio file: {self.output_file} ({file_size} bytes)")
         return self.output_file
 
@@ -944,12 +897,12 @@ class AudioRecorderDaemon:
 
     def cleanup(self) -> None:
         """Cleanup audio resources."""
-        if self._sd_stream:
+        if self._av_recorder is not None:
             try:
-                self._sd_stream.stop()
-                self._sd_stream.close()
+                self._av_recorder.stop()
             except Exception:
                 pass
+            self._av_recorder = None
         if self.process and self.process.poll() is None:
             self.process.terminate()
 
@@ -1400,14 +1353,6 @@ def main():
                 stop_recording_event.clear()
                 logger.info("Received stop recording signal")
                 daemon.stop_and_process()
-                # Intentionally no PortAudio reinit here: if abort() is
-                # still stuck in the sd-stop helper thread it holds the
-                # PortAudio internal mutex, and calling Pa_Terminate on
-                # the main thread deadlocks waiting for it. The next
-                # start_recording has its own retry path that reinits on
-                # InputStream failure, which is the safer moment to do it.
-                if getattr(daemon.recorder, "_portaudio_hung", False):
-                    daemon.recorder._portaudio_hung = False
 
             # Check for max recording duration
             if (MAX_RECORDING_SECONDS > 0
@@ -1421,15 +1366,6 @@ def main():
                 except OSError:
                     pass
                 daemon.stop_and_process()
-                if getattr(daemon.recorder, "_portaudio_hung", False):
-                    try:
-                        import sounddevice as _sd
-                        _sd._terminate()
-                        _sd._initialize()
-                        logger.info("Reinitialized PortAudio after hung stop")
-                    except Exception as exc:
-                        logger.warning(f"PortAudio reinit failed: {exc}")
-                    daemon.recorder._portaudio_hung = False
 
             # Check for idle timeout
             if daemon.is_idle_timeout_exceeded():

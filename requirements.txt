@@ -10,3 +10,4 @@ soundfile>=0.12.0   # WAV file writing for sounddevice
 numpy>=1.20.0       # Required by sounddevice
 silero-vad>=5.1  # Optional: VAD trimming to prevent hallucinations on silence
 pyobjc-framework-Quartz; sys_platform == "darwin"  # macOS: CGEvent paste + shift-to-submit
+pyobjc-framework-AVFoundation; sys_platform == "darwin"  # macOS: AVAudioRecorder (replaces sounddevice)

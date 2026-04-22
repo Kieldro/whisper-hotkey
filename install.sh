@@ -125,7 +125,10 @@ fi
 # disables shift-to-submit).
 if [ "$OS_TYPE" = "Darwin" ]; then
     echo "Installing macOS audio and paste dependencies..."
-    pip install -q sounddevice soundfile numpy pyobjc-framework-Quartz
+    # numpy is pulled in by silero-vad / onnx-asr already, but listed here
+    # for manual-install clarity. AVAudioRecorder replaces sounddevice on
+    # macOS (PortAudio's stop/abort can hang indefinitely on CoreAudio).
+    pip install -q numpy pyobjc-framework-Quartz pyobjc-framework-AVFoundation
 fi
 
 echo ""
