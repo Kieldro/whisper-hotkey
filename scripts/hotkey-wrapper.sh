@@ -5,7 +5,8 @@
 # Fast path: when the daemon is already running, signal it directly from
 # bash (~5ms) instead of spawning a Python interpreter (~120ms).
 
-RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+RUNTIME_DIR="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}"
+RUNTIME_DIR="${RUNTIME_DIR%/}"  # strip trailing slash
 LOCK_FILE="$RUNTIME_DIR/whisper-hotkey-daemon.lock"
 STATE_FILE="$RUNTIME_DIR/whisper-hotkey-state"
 

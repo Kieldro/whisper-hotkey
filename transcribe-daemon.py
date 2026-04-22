@@ -20,8 +20,9 @@ import fcntl
 import shutil
 from pathlib import Path
 from typing import Optional
+import platform
+IS_MACOS = platform.system() == "Darwin"
 
-from openai import OpenAI
 from dotenv import load_dotenv
 import time
 
@@ -29,7 +30,8 @@ import time
 load_dotenv()
 
 # Setup logging - use user-private log file
-LOG_FILE = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey.log")
+RUNTIME_DIR = os.getenv("TMPDIR", "/tmp").rstrip('/') if IS_MACOS else os.getenv("XDG_RUNTIME_DIR", "/tmp")
+LOG_FILE = os.path.join(RUNTIME_DIR, "whisper-hotkey.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -77,9 +79,15 @@ RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"
 ENABLE_OVERLAY = os.getenv("ENABLE_OVERLAY", "true").lower() == "true"
 
 # Sound file paths (optional - will skip if not found)
-SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
-SOUND_LOADING = os.getenv("SOUND_LOADING", "/usr/share/sounds/ubuntu/ringtones/Wind chime.ogg")
-SOUND_PASTE = os.getenv("SOUND_PASTE", "/usr/share/sounds/ubuntu/notifications/Positive.ogg")
+if IS_MACOS:
+    SOUND_START = os.getenv("SOUND_START", "/System/Library/Sounds/Ping.aiff")
+    _chime = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds", "loading-chime.wav")
+    SOUND_LOADING = os.getenv("SOUND_LOADING", _chime)
+    SOUND_PASTE = os.getenv("SOUND_PASTE", "/System/Library/Sounds/Glass.aiff")
+else:
+    SOUND_START = os.getenv("SOUND_START", "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga")
+    SOUND_LOADING = os.getenv("SOUND_LOADING", "/usr/share/sounds/ubuntu/ringtones/Wind chime.ogg")
+    SOUND_PASTE = os.getenv("SOUND_PASTE", "/usr/share/sounds/ubuntu/notifications/Positive.ogg")
 
 # Shared notification ID for replacing notifications
 NOTIFICATION_ID = 999999
@@ -93,7 +101,7 @@ VALID_WHISPER_MODELS = {
     "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large",
     "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
 }
-VALID_DEVICES = {"cpu", "cuda", "auto"}
+VALID_DEVICES = {"cpu", "cuda", "auto", "mps"}
 VALID_COMPUTE_TYPES = {
     "int8", "int8_float16", "int8_float32", "int16",
     "float16", "float32", "bfloat16", "auto",
@@ -136,27 +144,31 @@ def send_notification(message: str) -> None:
     if not ENABLE_NOTIFICATIONS:
         return
     try:
-        subprocess.run(
-            ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        if IS_MACOS:
+            subprocess.run(
+                ['osascript', '-e', f'display notification "{message}" with title "Voice Transcription"'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:
+            subprocess.run(
+                ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
     except FileNotFoundError:
-        pass  # notify-send not installed
+        pass  # notify tool not installed
 
 
 def play_sound(sound_file: str) -> None:
-    """Play a sound file using paplay (non-blocking, fails silently)."""
+    """Play a sound file (non-blocking, fails silently)."""
     if not sound_file or not os.path.exists(sound_file):
         return
     try:
-        subprocess.Popen(
-            ['paplay', sound_file],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+        cmd = ['afplay', sound_file] if IS_MACOS else ['paplay', sound_file]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
-        pass  # paplay not installed
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -187,43 +199,54 @@ def cleanup_status() -> None:
 
 
 def is_shift_held() -> bool:
-    """Check if Shift is currently pressed via X11 XQueryKeymap."""
-    try:
-        x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
-        display = x11.XOpenDisplay(None)
-        if not display:
+    """Check if Shift is currently held.
+
+    macOS: CGEventSourceFlagsState reads physical modifier key state directly.
+    Linux: reads X11 keymap directly.
+    """
+    if IS_MACOS:
+        try:
+            from Quartz import CGEventSourceFlagsState, kCGEventFlagMaskShift
+            # kCGEventSourceStateHIDSystemState (1) = physical key state
+            flags = CGEventSourceFlagsState(1)
+            return bool(flags & kCGEventFlagMaskShift)
+        except Exception:
             return False
-        keymap = (ctypes.c_char * 32)()
-        x11.XQueryKeymap(display, keymap)
-        x11.XCloseDisplay(display)
-        # Shift_L = keycode 50, Shift_R = keycode 62
-        sl = ord(keymap[50 // 8]) & (1 << (50 % 8))
-        sr = ord(keymap[62 // 8]) & (1 << (62 % 8))
-        return bool(sl or sr)
-    except Exception:
-        return False
+    else:
+        try:
+            x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+            display = x11.XOpenDisplay(None)
+            if not display:
+                return False
+            keymap = (ctypes.c_char * 32)()
+            x11.XQueryKeymap(display, keymap)
+            x11.XCloseDisplay(display)
+            # Shift_L = keycode 50, Shift_R = keycode 62
+            sl = ord(keymap[50 // 8]) & (1 << (50 % 8))
+            sr = ord(keymap[62 // 8]) & (1 << (62 % 8))
+            return bool(sl or sr)
+        except Exception:
+            return False
 
 
 # Detect session type for clipboard/typing
 def detect_session_type():
-    """Detect the actual running display server session."""
+    """Detect the display server session type."""
+    if IS_MACOS:
+        return "macos"
 
-    # First, detect the actual running session using environment variables
     session_type = os.getenv("XDG_SESSION_TYPE", "").lower()
     wayland_display = os.getenv("WAYLAND_DISPLAY")
     x11_display = os.getenv("DISPLAY")
 
-    # Determine session from environment
     if session_type == "wayland" or wayland_display:
         detected_session = "wayland"
     elif session_type == "x11" or x11_display:
         detected_session = "x11"
     else:
-        # Fallback: couldn't determine, default to X11
         logger.warning("Could not detect session type from environment, defaulting to X11")
         detected_session = "x11"
 
-    # Verify required tools are available for the detected session
     if detected_session == "wayland":
         has_wl_copy = shutil.which("wl-copy") is not None
         has_ydotool = shutil.which("ydotool") is not None
@@ -501,7 +524,9 @@ def apply_word_replacements(text: str) -> str:
 def save_clipboard() -> Optional[bytes]:
     """Save current clipboard contents before overwriting."""
     try:
-        if SESSION_TYPE == "wayland":
+        if IS_MACOS:
+            cmd = ["pbpaste"]
+        elif SESSION_TYPE == "wayland":
             cmd = ["wl-paste", "--no-newline"]
         else:
             cmd = ["xclip", "-selection", "clipboard", "-o"]
@@ -521,7 +546,9 @@ def restore_clipboard(content: Optional[bytes]) -> None:
         return
 
     try:
-        if SESSION_TYPE == "wayland":
+        if IS_MACOS:
+            cmd = ["pbcopy"]
+        elif SESSION_TYPE == "wayland":
             cmd = ["wl-copy"]
         else:
             cmd = ["xclip", "-selection", "clipboard"]
@@ -539,7 +566,9 @@ def _build_paste_chain() -> list:
     """Build ordered list of paste methods based on session type and available tools."""
     chain = []
 
-    if SESSION_TYPE == "wayland":
+    if IS_MACOS:
+        chain.append("macos-cgevent")
+    elif SESSION_TYPE == "wayland":
         if shutil.which("wtype"):
             chain.append("wtype")
         if shutil.which("ydotool"):
@@ -559,7 +588,9 @@ logger.info(f"Paste chain: {PASTE_CHAIN}")
 def _copy_to_clipboard(text: str) -> None:
     """Copy text to clipboard (helper for clipboard-based paste methods)."""
     try:
-        if SESSION_TYPE == "wayland":
+        if IS_MACOS:
+            subprocess.run(["pbcopy"], input=text.encode(), timeout=2, check=False)
+        elif SESSION_TYPE == "wayland":
             subprocess.run(["wl-copy"], input=text.encode(), timeout=2, check=False)
         else:
             subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), timeout=2, check=False)
@@ -569,6 +600,28 @@ def _copy_to_clipboard(text: str) -> None:
 
 def _execute_paste(method: str, text: str) -> bool:
     """Execute a single paste method. Returns True on success."""
+    if method == "macos-cgevent":
+        _copy_to_clipboard(text)
+        try:
+            from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
+                                CGEventPost, kCGEventFlagMaskCommand, kCGHIDEventTap)
+            # Cmd+V: keycode 9 = V. CGEvent ignores physical modifiers (e.g. Shift)
+            ev = CGEventCreateKeyboardEvent(None, 9, True)
+            CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+            CGEventPost(kCGHIDEventTap, ev)
+            time.sleep(0.05)
+            ev = CGEventCreateKeyboardEvent(None, 9, False)
+            CGEventSetFlags(ev, kCGEventFlagMaskCommand)
+            CGEventPost(kCGHIDEventTap, ev)
+            return True
+        except Exception as e:
+            logger.warning(f"CGEvent Cmd+V failed ({e}), trying osascript fallback")
+            result = subprocess.run(
+                ['osascript', '-e',
+                 'tell application "System Events" to keystroke "v" using {command down}'],
+                timeout=5, capture_output=True, check=False)
+            return result.returncode == 0
+
     if method == "wtype":
         result = subprocess.run(
             ["wtype", "--", text],
@@ -634,7 +687,7 @@ def paste_text(text: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 class AudioRecorderDaemon:
-    """Non-blocking audio recorder using parecord."""
+    """Non-blocking audio recorder. Uses sounddevice on macOS, parecord on Linux."""
 
     def __init__(self, sample_rate: int = SAMPLE_RATE):
         self.sample_rate = sample_rate
@@ -642,20 +695,79 @@ class AudioRecorderDaemon:
         self.recording_start_time: Optional[float] = None
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
+        self._sd_stream = None
+        self._audio_queue = None
 
     def start_recording(self) -> bool:
-        """Start recording with parecord. Returns True on success."""
+        """Start recording. Returns True on success."""
         if self.is_recording:
             logger.warning("Already recording, ignoring start request")
             return False
+        if IS_MACOS:
+            return self._start_recording_macos()
+        return self._start_recording_linux()
 
-        # Create temp file for new recording
+    def _start_recording_macos(self) -> bool:
+        """Record audio using sounddevice (macOS CoreAudio)."""
+        import queue as _queue
+        try:
+            import sounddevice as sd
+        except ImportError:
+            logger.error("sounddevice not installed. Run: pip install sounddevice soundfile numpy")
+            send_notification("❌ sounddevice not installed")
+            return False
+
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         self.output_file = temp_file.name
         temp_file.close()
         logger.info(f"Created temp audio file: {self.output_file}")
 
-        # Start parecord
+        self._audio_queue = _queue.Queue()
+
+        def callback(indata, frames, time, status):
+            if status:
+                logger.warning(f"Audio status: {status}")
+            self._audio_queue.put(indata.copy())
+
+        for attempt in range(2):
+            try:
+                self._sd_stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype='int16',
+                    callback=callback
+                )
+                self._sd_stream.start()
+                break
+            except Exception as e:
+                if attempt == 0:
+                    # PortAudio handle may be stale after sleep/wake — reinit and retry
+                    logger.warning(f"Audio open failed ({e}), reinitializing PortAudio...")
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+                else:
+                    logger.error(f"Failed to start sounddevice after retry: {e}")
+                    send_notification(f"❌ Recording failed: {str(e)[:30]}")
+                    self._cleanup_temp_files()
+                    return False
+
+        self.is_recording = True
+        logger.info("Recording started (sounddevice/CoreAudio)")
+        play_sound(SOUND_START)
+        send_notification("🎤 Recording...")
+        return True
+
+    def _start_recording_linux(self) -> bool:
+        """Record audio using parecord (Linux/PulseAudio)."""
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        self.output_file = temp_file.name
+        temp_file.close()
+        logger.info(f"Created temp audio file: {self.output_file}")
+
         logger.info(f"Starting parecord (rate={self.sample_rate})")
         try:
             self.process = subprocess.Popen(
@@ -710,17 +822,55 @@ class AudioRecorderDaemon:
         if not self.is_recording:
             logger.warning("Not recording, ignoring stop request")
             return None
+        if IS_MACOS:
+            return self._stop_recording_macos()
+        return self._stop_recording_linux()
 
-        logger.info("Stopping recording...")
+    def _stop_recording_macos(self) -> Optional[str]:
+        """Stop sounddevice recording, close stream, write WAV file."""
+        logger.info("Stopping recording (sounddevice)...")
+        self.is_recording = False
+
+        time.sleep(TRAILING_SPEECH_DELAY)
+
+        if self._sd_stream:
+            self._sd_stream.stop()
+            self._sd_stream.close()
+            self._sd_stream = None
+
+        # Drain queue and write WAV
+        frames = []
+        while self._audio_queue and not self._audio_queue.empty():
+            frames.append(self._audio_queue.get())
+
+        if not frames:
+            logger.error("No audio recorded (empty queue)")
+            return None
+
+        try:
+            import numpy as np
+            import soundfile as sf
+            audio_data = np.concatenate(frames, axis=0)
+            sf.write(self.output_file, audio_data, self.sample_rate, subtype='PCM_16')
+        except ImportError as e:
+            logger.error(f"Missing dependency: {e}. Run: pip install sounddevice soundfile numpy")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to write audio file: {e}")
+            return None
+
+        file_size = os.path.getsize(self.output_file)
+        logger.info(f"Final audio file: {self.output_file} ({file_size} bytes)")
+        return self.output_file
+
+    def _stop_recording_linux(self) -> Optional[str]:
+        """Stop parecord recording."""
+        logger.info("Stopping recording (parecord)...")
         self.is_recording = False
 
         if self.process:
-            # Delay to capture trailing speech after key release
             time.sleep(TRAILING_SPEECH_DELAY)
             logger.info(f"Stopping parecord process {self.process.pid}")
-            # SIGINT triggers clean shutdown so parecord flushes its write buffer
-            # and finalizes the WAV header. SIGTERM can kill it before flushing,
-            # producing empty/truncated files.
             self.process.send_signal(signal.SIGINT)
             try:
                 self.process.wait(timeout=3)
@@ -736,7 +886,6 @@ class AudioRecorderDaemon:
             logger.info("parecord stopped")
             self.process = None
 
-        # Check file size
         if self.output_file and os.path.exists(self.output_file):
             file_size = os.path.getsize(self.output_file)
             logger.info(f"Final audio file: {self.output_file} ({file_size} bytes)")
@@ -748,6 +897,12 @@ class AudioRecorderDaemon:
 
     def cleanup(self) -> None:
         """Cleanup audio resources."""
+        if self._sd_stream:
+            try:
+                self._sd_stream.stop()
+                self._sd_stream.close()
+            except Exception:
+                pass
         if self.process and self.process.poll() is None:
             self.process.terminate()
 
@@ -781,6 +936,7 @@ class TranscriptionPipeline:
 
         if ENABLE_POLISHING:
             logger.info("Initializing OpenAI client...")
+            from openai import OpenAI
             self.openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         else:
             self.openai = None
@@ -866,17 +1022,34 @@ class TranscriptionPipeline:
 
         # Auto-paste if enabled
         if AUTO_PASTE:
-            # No clipboard wait needed: _copy_to_clipboard already blocks on subprocess.run
+            # Capture shift state before paste (paste itself clears physical modifiers on some platforms)
+            submit_after_paste = is_shift_held()
             success, method_used = paste_text(final_text)
 
             if not success:
                 send_notification("Paste failed (text copied to clipboard)")
 
             # If Shift is held during paste, press Enter to submit
-            if is_shift_held():
-                logger.info("Shift held during paste, pressing Enter to submit")
-                time.sleep(0.1)
-                if SESSION_TYPE == "wayland":
+            if submit_after_paste or (not IS_MACOS and is_shift_held()):
+                logger.info("Shift-to-submit: pressing Enter")
+                time.sleep(0.2)  # wait for paste to be processed by app
+                if IS_MACOS:
+                    try:
+                        from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
+                                            CGEventPost, kCGHIDEventTap)
+                        ev = CGEventCreateKeyboardEvent(None, 36, True)
+                        CGEventSetFlags(ev, 0)
+                        CGEventPost(kCGHIDEventTap, ev)
+                        time.sleep(0.05)
+                        ev = CGEventCreateKeyboardEvent(None, 36, False)
+                        CGEventSetFlags(ev, 0)
+                        CGEventPost(kCGHIDEventTap, ev)
+                    except Exception:
+                        subprocess.run(
+                            ['osascript', '-e',
+                             'tell application "System Events" to key code 36'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif SESSION_TYPE == "wayland":
                     subprocess.run(['ydotool', 'key', '28:1', '28:0'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 else:
@@ -1013,8 +1186,8 @@ def main():
         print("Error: OPENAI_API_KEY not set (required when ENABLE_POLISHING=true)", file=sys.stderr)
         sys.exit(1)
 
-    state_file = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-state")
-    daemon_lock_file = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-daemon.lock")
+    state_file = os.path.join(RUNTIME_DIR, "whisper-hotkey-state")
+    daemon_lock_file = os.path.join(RUNTIME_DIR, "whisper-hotkey-daemon.lock")
 
     # Try to acquire the daemon lock
     lock_fd = acquire_daemon_lock(daemon_lock_file)
@@ -1108,8 +1281,9 @@ def main():
     loading_sound_proc = None
     if SOUND_LOADING and os.path.exists(SOUND_LOADING):
         try:
+            cmd = ['afplay', SOUND_LOADING] if IS_MACOS else ['paplay', SOUND_LOADING]
             loading_sound_proc = subprocess.Popen(
-                ['paplay', SOUND_LOADING],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )

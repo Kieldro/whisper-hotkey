@@ -7,6 +7,7 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WRAPPER_SCRIPT="$PROJECT_DIR/scripts/hotkey-wrapper.sh"
 VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
+OS_TYPE=$(uname -s)
 
 echo "🔧 Voice Transcription Hotkey Setup"
 echo "===================================="
@@ -17,6 +18,43 @@ if [ ! -f "$VENV_PYTHON" ]; then
     echo "❌ Virtual environment not found at $VENV_PYTHON"
     echo "Run: python3 -m venv venv && pip install -r requirements.txt"
     exit 1
+fi
+
+# --- macOS: use Hammerspoon ---
+if [ "$OS_TYPE" = "Darwin" ]; then
+    HS_CONFIG="$HOME/.hammerspoon/init.lua"
+    mkdir -p "$(dirname "$HS_CONFIG")"
+
+    echo "📝 macOS setup using Hammerspoon:"
+    echo "Hotkey: Option+Space (press once to start, again to stop)"
+    echo ""
+
+    if grep -q "whisper-hotkey" "$HS_CONFIG" 2>/dev/null; then
+        echo "⚠️  Hotkey already exists in Hammerspoon config"
+    else
+        cat >> "$HS_CONFIG" << LUAEOF
+
+-- Whisper Hotkey: Option+Space → toggle push-to-talk transcription
+local wrapper = "$WRAPPER_SCRIPT"
+hs.hotkey.bind({"alt"}, "space", function()
+    hs.task.new(wrapper, nil):start()
+end)
+LUAEOF
+        echo "✅ Added to $HS_CONFIG"
+    fi
+
+    if [ -d "/Applications/Hammerspoon.app" ]; then
+        open /Applications/Hammerspoon.app
+        echo "✅ Hammerspoon launched — reload config with Cmd+Shift+R in the Hammerspoon console"
+    else
+        echo "⚠️  Hammerspoon not installed. Run: brew install --cask hammerspoon"
+    fi
+
+    echo ""
+    echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add Hammerspoon"
+    echo ""
+    echo "✅ Setup complete!"
+    exit 0
 fi
 
 # Detect desktop environment

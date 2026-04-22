@@ -6,13 +6,16 @@ set -e
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$PROJECT_DIR/venv"
+OS_TYPE=$(uname -s)  # "Linux" or "Darwin"
 
 echo "Whisper Hotkey Installer"
 echo "========================"
 echo ""
 
 # --- Detect session type ---
-if [ "$XDG_SESSION_TYPE" = "wayland" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+if [ "$OS_TYPE" = "Darwin" ]; then
+    SESSION="macos"
+elif [ "$XDG_SESSION_TYPE" = "wayland" ] || [ -n "$WAYLAND_DISPLAY" ]; then
     SESSION="wayland"
 else
     SESSION="x11"
@@ -20,7 +23,9 @@ fi
 echo "Session: $SESSION"
 
 # --- Detect distro ---
-if command -v apt &>/dev/null; then
+if [ "$OS_TYPE" = "Darwin" ]; then
+    PKG_MGR="brew"
+elif command -v apt &>/dev/null; then
     PKG_MGR="apt"
 elif command -v pacman &>/dev/null; then
     PKG_MGR="pacman"
@@ -43,13 +48,21 @@ if [ "$SESSION" = "wayland" ]; then
     SESSION_DEPS_APT="wl-clipboard ydotool"
     SESSION_DEPS_PACMAN="wl-clipboard ydotool"
     SESSION_DEPS_DNF="wl-clipboard ydotool"
-else
+elif [ "$SESSION" = "x11" ]; then
     SESSION_DEPS_APT="xclip xdotool"
     SESSION_DEPS_PACMAN="xclip xdotool"
     SESSION_DEPS_DNF="xclip xdotool"
 fi
 
 case $PKG_MGR in
+    brew)
+        # macOS: Hammerspoon for global hotkeys (pbcopy/osascript are built-in)
+        if ! command -v brew &>/dev/null; then
+            echo "❌ Homebrew not found. Install from https://brew.sh first."
+            exit 1
+        fi
+        brew install --cask hammerspoon 2>/dev/null || true
+        ;;
     apt)
         sudo apt update -qq
         sudo apt install -y $COMMON_DEPS_APT $SESSION_DEPS_APT
@@ -65,7 +78,7 @@ case $PKG_MGR in
         echo "  python3, pip, portaudio, pulseaudio-utils, libnotify"
         if [ "$SESSION" = "wayland" ]; then
             echo "  wl-clipboard, ydotool"
-        else
+        elif [ "$SESSION" = "x11" ]; then
             echo "  xclip, xdotool"
         fi
         echo ""
@@ -105,19 +118,38 @@ else
     pip install -q "onnx-asr[hub]" "onnxruntime!=1.21" openai python-dotenv "silero-vad>=5.1"
 fi
 
+# macOS audio recording deps (sounddevice bundles PortAudio, no brew dep needed)
+if [ "$OS_TYPE" = "Darwin" ]; then
+    echo "Installing macOS audio dependencies..."
+    pip install -q sounddevice soundfile numpy
+fi
+
 echo ""
 
 # --- Create .env if it doesn't exist ---
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
-    sed -i "s/^ENGINE=.*/ENGINE=$ENGINE/" "$PROJECT_DIR/.env"
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        sed -i '' "s/^ENGINE=.*/ENGINE=$ENGINE/" "$PROJECT_DIR/.env"
+    else
+        sed -i "s/^ENGINE=.*/ENGINE=$ENGINE/" "$PROJECT_DIR/.env"
+    fi
     echo "Created .env from template (engine=$ENGINE)"
 else
     echo ".env already exists, skipping"
 fi
 
 # --- GPU detection ---
-if command -v nvidia-smi &>/dev/null; then
+if [ "$OS_TYPE" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && [ "$ENGINE" = "whisper" ]; then
+    echo ""
+    read -p "Apple Silicon detected. Enable MPS acceleration? [Y/n]: " USE_MPS
+    USE_MPS="${USE_MPS:-Y}"
+    if [[ "$USE_MPS" =~ ^[Yy] ]]; then
+        sed -i '' "s/^DEVICE=.*/DEVICE=mps/" "$PROJECT_DIR/.env"
+        sed -i '' "s/^COMPUTE_TYPE=.*/COMPUTE_TYPE=float16/" "$PROJECT_DIR/.env"
+        echo "MPS enabled"
+    fi
+elif command -v nvidia-smi &>/dev/null; then
     echo ""
     read -p "NVIDIA GPU detected. Enable CUDA acceleration? [Y/n]: " USE_CUDA
     USE_CUDA="${USE_CUDA:-Y}"
