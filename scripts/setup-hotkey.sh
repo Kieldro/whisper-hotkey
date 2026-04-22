@@ -32,6 +32,7 @@ if [ "$OS_TYPE" = "Darwin" ]; then
     if ! command -v skhd >/dev/null 2>&1; then
         if command -v brew >/dev/null 2>&1; then
             echo "📦 Installing skhd via Homebrew..."
+            brew tap koekeishiya/formulae 2>/dev/null
             brew install skhd
         else
             echo "❌ Homebrew not found. Install from https://brew.sh then rerun."
@@ -47,8 +48,8 @@ if [ "$OS_TYPE" = "Darwin" ]; then
         echo "✅ Added binding to $SKHD_CONFIG"
     fi
 
-    brew services restart skhd >/dev/null
-    echo "✅ skhd service started"
+    skhd --restart-service >/dev/null 2>&1 || skhd --start-service
+    echo "✅ skhd service started (logs: /tmp/skhd_$(whoami).out.log)"
 
     echo ""
     echo "⚠️  Grant Accessibility permissions: System Settings → Privacy & Security → Accessibility → add skhd"

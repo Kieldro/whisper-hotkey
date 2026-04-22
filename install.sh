@@ -61,6 +61,7 @@ case $PKG_MGR in
             echo "❌ Homebrew not found. Install from https://brew.sh first."
             exit 1
         fi
+        brew tap koekeishiya/formulae 2>/dev/null || true
         brew install skhd 2>/dev/null || true
         ;;
     apt)
