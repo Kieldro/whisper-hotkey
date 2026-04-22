@@ -35,12 +35,12 @@ LOG_FILE = os.path.join(RUNTIME_DIR, "whisper-hotkey.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stderr)
-    ]
+    handlers=[logging.FileHandler(LOG_FILE)],
 )
 logger = logging.getLogger(__name__)
+# Route uncaught exceptions through the logger so they land in the same file
+# (previously they went to stderr and were swallowed by `2>/dev/null`).
+sys.excepthook = lambda t, v, tb: logger.error("Uncaught exception", exc_info=(t, v, tb))
 
 # Configuration
 ENGINE = os.getenv("ENGINE", "parakeet")  # whisper or parakeet
@@ -61,6 +61,11 @@ try:
     TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.5"))
 except ValueError:
     print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
+    sys.exit(1)
+try:
+    STREAM_STOP_TIMEOUT = float(os.getenv("STREAM_STOP_TIMEOUT", "3.0"))
+except ValueError:
+    print(f"Error: STREAM_STOP_TIMEOUT='{os.getenv('STREAM_STOP_TIMEOUT')}' is not a valid number", file=sys.stderr)
     sys.exit(1)
 
 # Feature configs
@@ -620,6 +625,8 @@ def _execute_paste(method: str, text: str) -> bool:
                 ['osascript', '-e',
                  'tell application "System Events" to keystroke "v" using {command down}'],
                 timeout=5, capture_output=True, check=False)
+            if result.returncode == 0:
+                logger.info("Pasted via osascript fallback (install pyobjc-framework-Quartz for native path)")
             return result.returncode == 0
 
     if method == "wtype":
@@ -827,18 +834,50 @@ class AudioRecorderDaemon:
         return self._stop_recording_linux()
 
     def _stop_recording_macos(self) -> Optional[str]:
-        """Stop sounddevice recording, close stream, write WAV file."""
+        """Stop sounddevice recording, close stream, write WAV file.
+
+        PortAudio's stop()/close() can hang indefinitely when CoreAudio state
+        shifts (device change, sleep/wake, buffer stall). A hang there blocks
+        the daemon forever — signal handlers can't fire while the main thread
+        is inside a native call. We run stop/close on a helper thread with a
+        timeout; if it hangs we salvage the queued audio and set
+        ``_portaudio_hung`` so main() can restart the process cleanly.
+        """
         logger.info("Stopping recording (sounddevice)...")
         self.is_recording = False
 
+        logger.info(f"[stop:1/6] trailing sleep {TRAILING_SPEECH_DELAY}s")
         time.sleep(TRAILING_SPEECH_DELAY)
 
-        if self._sd_stream:
-            self._sd_stream.stop()
-            self._sd_stream.close()
-            self._sd_stream = None
+        stream = self._sd_stream
+        self._sd_stream = None
+        self._portaudio_hung = False
+        if stream is not None:
+            done = threading.Event()
+            t0 = time.monotonic()
 
-        # Drain queue and write WAV
+            def _close_stream():
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as exc:
+                    logger.warning(f"stream stop/close raised: {exc}")
+                finally:
+                    done.set()
+
+            threading.Thread(target=_close_stream, daemon=True, name="sd-stop").start()
+            if done.wait(timeout=STREAM_STOP_TIMEOUT):
+                logger.info(f"[stop:2-4/6] stream stop+close in {time.monotonic()-t0:.3f}s")
+            else:
+                self._portaudio_hung = True
+                logger.error(
+                    f"[stop:2-4/6] stream stop+close HUNG >{STREAM_STOP_TIMEOUT}s — "
+                    "salvaging audio; daemon will exit after processing"
+                )
+
+        # Drain queue (thread-safe even if the stream is zombied)
+        qsize = self._audio_queue.qsize() if self._audio_queue else 0
+        logger.info(f"[stop:5/6] draining audio queue ({qsize} items)")
         frames = []
         while self._audio_queue and not self._audio_queue.empty():
             frames.append(self._audio_queue.get())
@@ -851,6 +890,7 @@ class AudioRecorderDaemon:
             import numpy as np
             import soundfile as sf
             audio_data = np.concatenate(frames, axis=0)
+            logger.info(f"[stop:6/6] writing WAV ({audio_data.shape[0]} samples)")
             sf.write(self.output_file, audio_data, self.sample_rate, subtype='PCM_16')
         except ImportError as e:
             logger.error(f"Missing dependency: {e}. Run: pip install sounddevice soundfile numpy")
@@ -917,7 +957,17 @@ class TranscriptionPipeline:
         if self.engine == "parakeet":
             logger.info("Loading Parakeet TDT model via onnx-asr...")
             import onnx_asr
-            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3")
+            import onnxruntime as rt
+            # CoreMLExecutionProvider crashes on parakeet because the encoder
+            # uses external-data (.onnx.data) and CoreML's initializer loses
+            # the path: "model_path must not be empty" (reproduced on
+            # onnxruntime 1.24.x and 1.25.0). Exclude CoreML but keep every
+            # other provider — on Linux/NVIDIA this preserves CUDA/TensorRT
+            # acceleration; on macOS it falls back to CPU (~107ms inference
+            # on Apple Silicon, so still plenty fast).
+            providers = [p for p in rt.get_available_providers() if p != "CoreMLExecutionProvider"]
+            logger.info(f"onnxruntime providers: {providers}")
+            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", providers=providers)
             logger.info("Parakeet model loaded successfully")
         else:
             from faster_whisper import WhisperModel
@@ -1277,27 +1327,38 @@ def main():
     # Create state file immediately so extra presses during load send STOP (not START)
     Path(state_file).touch()
 
-    # Play calming sound while model loads
-    loading_sound_proc = None
+    # Play calming sound while model loads — loop until model is ready
+    # (`afplay` has no loop flag and the chime is only ~4s, shorter than the
+    # model load; a background thread restarts it until we signal stop).
+    loading_sound_stop = threading.Event()
+    loading_sound_thread = None
     if SOUND_LOADING and os.path.exists(SOUND_LOADING):
-        try:
-            cmd = ['afplay', SOUND_LOADING] if IS_MACOS else ['paplay', SOUND_LOADING]
-            loading_sound_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except FileNotFoundError:
-            pass
+        player = 'afplay' if IS_MACOS else 'paplay'
 
+        def _loop_chime():
+            while not loading_sound_stop.is_set():
+                try:
+                    subprocess.run(
+                        [player, SOUND_LOADING],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=30,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    return
+
+        loading_sound_thread = threading.Thread(target=_loop_chime, daemon=True, name="loading-chime")
+        loading_sound_thread.start()
+
+    send_notification(f"Loading {ENGINE} model…")
     logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
     daemon.last_activity_time = time.time()
 
-    # Stop loading sound
-    if loading_sound_proc:
-        loading_sound_proc.terminate()
-        loading_sound_proc = None
+    # Stop loading sound loop and kill any in-flight player
+    loading_sound_stop.set()
+    subprocess.run(['pkill', '-x', 'afplay' if IS_MACOS else 'paplay'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
     # Clear any signals the user sent while the model was loading (impatient extra presses)
     start_recording_event.clear()
@@ -1326,6 +1387,10 @@ def main():
                 stop_recording_event.clear()
                 logger.info("Received stop recording signal")
                 daemon.stop_and_process()
+                if getattr(daemon.recorder, "_portaudio_hung", False):
+                    logger.error("PortAudio hung during stop; exiting daemon so next hotkey press starts fresh")
+                    send_notification("⚠️ Audio system hung — restarting on next press")
+                    shutdown_event.set()
 
             # Check for max recording duration
             if (MAX_RECORDING_SECONDS > 0
@@ -1339,6 +1404,10 @@ def main():
                 except OSError:
                     pass
                 daemon.stop_and_process()
+                if getattr(daemon.recorder, "_portaudio_hung", False):
+                    logger.error("PortAudio hung during stop; exiting daemon so next hotkey press starts fresh")
+                    send_notification("⚠️ Audio system hung — restarting on next press")
+                    shutdown_event.set()
 
             # Check for idle timeout
             if daemon.is_idle_timeout_exceeded():
@@ -1382,6 +1451,11 @@ def main():
         except OSError:
             pass
         logger.info("=== Daemon exiting ===")
+        # If a PortAudio stop hung, its native threads can prevent a clean
+        # interpreter exit. Force-kill so the process actually dies.
+        if getattr(daemon.recorder, "_portaudio_hung", False):
+            logging.shutdown()
+            os._exit(1)
 
 
 if __name__ == "__main__":

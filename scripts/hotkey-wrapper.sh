@@ -29,7 +29,10 @@ if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     exit 0
 fi
 
-# Cold start: no daemon running, launch Python to load model
-"$VENV_PYTHON" "$DAEMON_SCRIPT" 2>/dev/null &
+# Cold start: no daemon running, launch Python to load model.
+# Append stderr to the log file so uncaught Python exceptions during
+# model load are visible (otherwise the daemon can die silently).
+LOG_FILE="$RUNTIME_DIR/whisper-hotkey.log"
+"$VENV_PYTHON" "$DAEMON_SCRIPT" >>"$LOG_FILE" 2>>"$LOG_FILE" &
 disown
 exit 0

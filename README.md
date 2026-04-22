@@ -41,25 +41,25 @@ The installer auto-detects your OS and handles dependencies, Python environment,
 
 **What the installer does:**
 - Installs [skhd](https://github.com/koekeishiya/skhd) via Homebrew
-- Installs Python deps: sounddevice, soundfile, numpy, faster-whisper
+- Installs Python deps: sounddevice, soundfile, numpy, **pyobjc-framework-Quartz**, and your chosen engine (parakeet or faster-whisper)
 - Configures Option+Space hotkey in `~/.config/skhd/skhdrc`
 - Starts the skhd launchd service (`brew services start skhd`)
-- Offers MPS acceleration on Apple Silicon
+- Offers MPS acceleration on Apple Silicon (faster-whisper only)
 
 **After install — grant Accessibility permission:**
 System Settings > Privacy & Security > Accessibility > add skhd
 
-**Default engine:** faster-whisper with `tiny` model and `int8` compute — ~0.9s transcription for 5s of speech.
+**Recommended engine (Apple Silicon): Parakeet TDT 0.6b-v3** — ~0.3s transcription, built-in punctuation, 25 European languages, beats any faster-whisper size on this hardware. This is the installer default and what `ENGINE=parakeet` selects.
+
+**Intel Mac:** Parakeet runs but is very slow. Use `ENGINE=whisper` with `WHISPER_MODEL=small`.
 
 **Performance:**
 - First press: ~2.5s startup (model loads once, stays resident)
 - Subsequent presses: near-instant (audio stream stays open, model in memory)
 
-**GPU (Apple Silicon):** Set `DEVICE=mps` and `COMPUTE_TYPE=float16` in `.env` for faster-whisper acceleration.
+**GPU (Apple Silicon):** Parakeet runs on CPU via onnxruntime and is already fast enough. For `ENGINE=whisper`, set `DEVICE=mps` and `COMPUTE_TYPE=float16` in `.env`.
 
-**Parakeet engine:** Not recommended on Intel Mac (very slow). Only use on Apple Silicon.
-
-**Paste mechanism:** Uses `pbcopy` + `osascript` Cmd+V (requires Accessibility permission).
+**Paste mechanism:** `pyobjc-framework-Quartz` provides the fast CGEvent Cmd+V path (~5ms) and shift-to-submit detection. If Quartz is missing the daemon falls back to `osascript` (~100–300ms) and silently disables shift-to-submit — so install it.
 
 **Logs:** `tail -f $TMPDIR/whisper-hotkey.log`
 
@@ -134,15 +134,16 @@ Copy `.env.example` to `.env` and edit as needed:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENGINE` | `whisper` | `whisper` (recommended) or `parakeet` |
-| `WHISPER_MODEL` | `tiny` | Model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
-| `DEVICE` | `cpu` | `cpu`, `cuda` (NVIDIA), or `mps` (Apple Silicon) |
+| `ENGINE` | `parakeet` | `parakeet` (recommended on Apple Silicon / Linux) or `whisper` |
+| `WHISPER_MODEL` | `small` | Only used when `ENGINE=whisper`: `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `DEVICE` | `cpu` | `cpu`, `cuda` (NVIDIA), or `mps` (Apple Silicon, whisper only) |
 | `COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (GPU/MPS) |
 | `AUTO_PASTE` | `true` | Paste transcription into active window |
 | `ENABLE_POLISHING` | `false` | GPT grammar/formatting cleanup |
 | `OPENAI_API_KEY` | — | Required only if polishing is enabled |
-| `IDLE_TIMEOUT` | `600` | Seconds before daemon unloads model (0 = never) |
-| `TRAILING_SPEECH_DELAY` | `1.2` | Seconds to keep recording after hotkey release |
+| `IDLE_TIMEOUT` | `0` | Seconds before daemon unloads model (0 = never) |
+| `TRAILING_SPEECH_DELAY` | `0.2` | Seconds to keep recording after hotkey release |
+| `STREAM_STOP_TIMEOUT` | `3.0` | Max seconds to wait for PortAudio stop before abandoning stream and restarting daemon |
 
 ## Architecture
 

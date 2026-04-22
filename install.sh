@@ -120,9 +120,12 @@ else
 fi
 
 # macOS audio recording deps (sounddevice bundles PortAudio, no brew dep needed)
+# pyobjc-framework-Quartz enables the fast CGEvent paste path and shift-to-submit
+# detection (fallback is osascript, which works but is slower and silently
+# disables shift-to-submit).
 if [ "$OS_TYPE" = "Darwin" ]; then
-    echo "Installing macOS audio dependencies..."
-    pip install -q sounddevice soundfile numpy
+    echo "Installing macOS audio and paste dependencies..."
+    pip install -q sounddevice soundfile numpy pyobjc-framework-Quartz
 fi
 
 echo ""
