@@ -93,7 +93,7 @@ else:
 NOTIFICATION_ID = 999999
 
 # Status file for waybar/polybar integration
-STATUS_FILE = os.path.join(os.getenv("XDG_RUNTIME_DIR", "/tmp"), "whisper-hotkey-status.json")
+STATUS_FILE = os.path.join(RUNTIME_DIR, "whisper-hotkey-status.json")
 
 # Valid config values for validation
 VALID_WHISPER_MODELS = {
