@@ -44,15 +44,14 @@ STATE_CONFIG = {
     "error":        ("Error",        (1.00, 0.35, 0.35), False),
 }
 
-HEIGHT = 30.0
+HEIGHT = 44.0
 CORNER_RADIUS = HEIGHT / 2         # true capsule
-DOT_SIZE = 10.0
-SIDE_PAD = 14.0                    # left pad to dot & right pad after label
-DOT_TO_LABEL_GAP = 9.0
-FONT_POINT_SIZE = 13.0
-EDGE_MARGIN = 12.0
-MENU_BAR_CLEARANCE = 40.0          # menu bar is ~24pt; leave breathing room
-MAX_LABEL_WIDTH = 520.0            # cap on live-transcript width; truncate past this
+DOT_SIZE = 14.0
+SIDE_PAD = 20.0                    # left pad to dot & right pad after label
+DOT_TO_LABEL_GAP = 12.0
+FONT_POINT_SIZE = 18.0
+TOP_MARGIN = 64.0                  # below the menu bar with breathing room
+MAX_LABEL_WIDTH = 700.0            # cap on live-transcript width; truncate past this
 
 
 class StatusOverlay(NSObject):
@@ -162,11 +161,12 @@ class StatusOverlay(NSObject):
                                         (HEIGHT - label_frame.size.height) / 2,
                                         text_w, label_frame.size.height))
         # Resize window + blur view (autoresizing mask handles the blur).
-        # Anchor to the right edge so label width changes don't spill off
-        # the right of the screen when going "Recording" -> "Transcribing".
+        # Anchor to horizontal center so the pill grows/shrinks from both
+        # sides as the live transcript updates, and stays centered on
+        # screen regardless of content length.
         f = self.window.frame()
-        right_edge = f.origin.x + f.size.width
-        new_x = right_edge - pill_w
+        center_x = f.origin.x + f.size.width / 2
+        new_x = center_x - pill_w / 2
         self.window.setFrame_display_(NSMakeRect(new_x, f.origin.y, pill_w, HEIGHT), True)
         self.dot.layer().setBackgroundColor_(
             CGColorCreateGenericRGB(r, g, b, 1.0))
@@ -213,8 +213,9 @@ class StatusOverlay(NSObject):
             target = NSScreen.mainScreen()
         sf = target.frame()
         win_w = self.window.frame().size.width
-        x = sf.origin.x + sf.size.width - win_w - EDGE_MARGIN
-        y = sf.origin.y + sf.size.height - HEIGHT - MENU_BAR_CLEARANCE
+        # Horizontally centered on the chosen screen, TOP_MARGIN from the top.
+        x = sf.origin.x + (sf.size.width - win_w) / 2
+        y = sf.origin.y + sf.size.height - HEIGHT - TOP_MARGIN
         self.window.setFrameOrigin_(NSMakePoint(x, y))
 
 

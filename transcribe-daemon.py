@@ -703,6 +703,9 @@ class AudioRecorderDaemon:
         self._sfs_request = None
         self._sfs_task = None
         self._sfs_recognizer = None
+        self._sfs_stopped = False          # guard against late handler calls
+        self._sfs_segments: list = []      # finalized per-segment texts
+        self._sfs_current_partial: str = ""
         self.live_text: str = ""
         self._final_text: Optional[str] = None
 
@@ -836,6 +839,9 @@ class AudioRecorderDaemon:
                 SFSpeechRecognizer,
                 SFSpeechAudioBufferRecognitionRequest,
                 SFSpeechRecognizerAuthorizationStatusAuthorized,
+                SFSpeechRecognizerAuthorizationStatusNotDetermined,
+                SFSpeechRecognizerAuthorizationStatusDenied,
+                SFSpeechRecognizerAuthorizationStatusRestricted,
             )
             from AVFoundation import AVAudioEngine
         except ImportError as exc:
@@ -843,9 +849,43 @@ class AudioRecorderDaemon:
             send_notification("❌ pyobjc-framework-Speech not installed")
             return False
 
-        if SFSpeechRecognizer.authorizationStatus() != SFSpeechRecognizerAuthorizationStatusAuthorized:
-            logger.error("Speech Recognition not authorized")
-            send_notification("❌ Grant Speech Recognition permission in System Settings")
+        status = SFSpeechRecognizer.authorizationStatus()
+        if status == SFSpeechRecognizerAuthorizationStatusNotDetermined:
+            # First use: actually ask macOS to prompt the user. Wait a few
+            # seconds for them to click Allow/Deny; if we never resolve, we
+            # abort this recording but the TCC entry is now registered so
+            # they can grant it manually next time.
+            logger.info("Speech Recognition permission not yet requested; prompting...")
+            send_notification("Grant Speech Recognition permission in the prompt")
+            done = threading.Event()
+            got = [status]
+
+            def _auth_cb(new_status):
+                got[0] = new_status
+                done.set()
+
+            SFSpeechRecognizer.requestAuthorization_(_auth_cb)
+            try:
+                from Foundation import NSRunLoop, NSDate
+                deadline = time.monotonic() + 15
+                while not done.is_set() and time.monotonic() < deadline:
+                    NSRunLoop.currentRunLoop().runUntilDate_(
+                        NSDate.dateWithTimeIntervalSinceNow_(0.1))
+            except ImportError:
+                done.wait(15)
+            status = got[0]
+            if status != SFSpeechRecognizerAuthorizationStatusAuthorized:
+                logger.error(f"Speech Recognition not authorized after prompt (status={status})")
+                send_notification("❌ Speech Recognition permission required — try again")
+                return False
+            logger.info("Speech Recognition granted")
+        elif status == SFSpeechRecognizerAuthorizationStatusDenied:
+            logger.error("Speech Recognition denied by user")
+            send_notification("❌ Enable Speech Recognition in System Settings > Privacy")
+            return False
+        elif status == SFSpeechRecognizerAuthorizationStatusRestricted:
+            logger.error("Speech Recognition restricted (parental controls / MDM)")
+            send_notification("❌ Speech Recognition restricted on this Mac")
             return False
 
         recog = SFSpeechRecognizer.alloc().init()
@@ -854,32 +894,56 @@ class AudioRecorderDaemon:
             send_notification("❌ Enable Dictation in System Settings → Keyboard")
             return False
 
+        # Reset streaming accumulators.
+        self._sfs_stopped = False
+        self._sfs_segments = []
+        self._sfs_current_partial = ""
+        self.live_text = ""
+        self._final_text = None
+        self._sfs_recognizer = recog
+
+        # SFSpeechRecognizer finalizes its task on extended silence
+        # (~1-2 s pause) and on its internal ~60 s limit. When that
+        # happens the task stops delivering partials, which the user
+        # sees as "my text disappeared when I paused." We handle this by
+        # chaining tasks: on isFinal we append the segment's text to
+        # self._sfs_segments and immediately start a fresh request+task.
+        # The audio tap continues flowing into whichever request is
+        # currently installed.
+        def handler(result, err):
+            if self._sfs_stopped:
+                return
+            if err is not None:
+                # kAFAssistantErrorDomain 1110 = "No speech detected" —
+                # expected for long silences. Not fatal; the next
+                # segment (if any) will pick up on the next utterance.
+                msg = str(err)
+                if "1110" not in msg and "No speech" not in msg:
+                    logger.warning(f"Speech recognition error: {err}")
+                # Trigger a fresh segment if we're still active.
+                self._start_next_sfs_segment()
+                return
+            if result is None:
+                return
+            text = str(result.bestTranscription().formattedString())
+            self._sfs_current_partial = text
+            full = (" ".join(self._sfs_segments) + " " + text).strip()
+            self.live_text = full
+            update_status("recording", live_text=full)
+            if bool(result.isFinal()):
+                if text:
+                    self._sfs_segments.append(text)
+                self._sfs_current_partial = ""
+                self._start_next_sfs_segment()
+
+        self._sfs_handler = handler
+
         req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
         req.setShouldReportPartialResults_(True)
         if hasattr(req, "setRequiresOnDeviceRecognition_"):
             req.setRequiresOnDeviceRecognition_(True)
         if hasattr(req, "setAddsPunctuation_"):
             req.setAddsPunctuation_(True)
-
-        self.live_text = ""
-        self._final_text = None
-
-        def handler(result, err):
-            if err is not None:
-                # kAFAssistantErrorDomain code 1110 = "No speech detected";
-                # common if user presses stop quickly or stays silent.
-                logger.warning(f"Speech recognition error: {err}")
-                return
-            if result is None:
-                return
-            text = str(result.bestTranscription().formattedString())
-            self.live_text = text
-            update_status("recording", live_text=text)
-            if bool(result.isFinal()):
-                self._final_text = text
-                logger.info(f"Streaming final: {len(text)} chars")
-
-        self._sfs_recognizer = recog
         self._sfs_request = req
         self._sfs_task = recog.recognitionTaskWithRequest_resultHandler_(req, handler)
 
@@ -887,8 +951,12 @@ class AudioRecorderDaemon:
         inp = engine.inputNode()
         fmt = inp.outputFormatForBus_(0)
 
+        # Tap routes audio to whichever request is current at fire time,
+        # so it keeps working after we swap requests on segment boundaries.
         def tap(buf, when):
-            req.appendAudioPCMBuffer_(buf)
+            r = self._sfs_request
+            if r is not None and not self._sfs_stopped:
+                r.appendAudioPCMBuffer_(buf)
 
         inp.installTapOnBus_bufferSize_format_block_(0, 1024, fmt, tap)
         ok, err = engine.startAndReturnError_(None)
@@ -907,6 +975,25 @@ class AudioRecorderDaemon:
         update_status("recording", live_text="")
         return True
 
+    def _start_next_sfs_segment(self) -> None:
+        """Start a fresh SFSpeech request+task after the previous one
+        finalized on silence, so recording continues seamlessly."""
+        if self._sfs_stopped or self._sfs_recognizer is None:
+            return
+        try:
+            from Speech import SFSpeechAudioBufferRecognitionRequest
+        except ImportError:
+            return
+        req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
+        req.setShouldReportPartialResults_(True)
+        if hasattr(req, "setRequiresOnDeviceRecognition_"):
+            req.setRequiresOnDeviceRecognition_(True)
+        if hasattr(req, "setAddsPunctuation_"):
+            req.setAddsPunctuation_(True)
+        self._sfs_request = req
+        self._sfs_task = self._sfs_recognizer.recognitionTaskWithRequest_resultHandler_(
+            req, self._sfs_handler)
+
     def _stop_recording_apple_streaming(self) -> Optional[str]:
         """Finalize the streaming recognition and return the text.
 
@@ -916,6 +1003,10 @@ class AudioRecorderDaemon:
         """
         logger.info("Stopping recording (Apple streaming)...")
         self.is_recording = False
+        # Flip this before endAudio so any late handler callbacks (incl.
+        # isFinal from the last segment) are ignored and don't re-write
+        # state=recording onto the status JSON after we've moved on.
+        self._sfs_stopped = True
 
         # Give the user a brief tail so the last word isn't clipped,
         # but much shorter than the batch delay — streaming is live.
@@ -929,24 +1020,32 @@ class AudioRecorderDaemon:
                 logger.warning(f"AVAudioEngine stop raised: {exc}")
             self._av_engine = None
 
-        if self._sfs_request is not None:
+        last_req = self._sfs_request
+        if last_req is not None:
             try:
-                self._sfs_request.endAudio()
+                last_req.endAudio()
             except Exception as exc:
                 logger.warning(f"endAudio raised: {exc}")
 
-        # Wait briefly (up to 600 ms) for isFinal to land; otherwise use
-        # the last partial we saw.
+        # Wait briefly for the last segment's isFinal to land so we can
+        # include the most recent partial as a finalized segment.
         try:
             from Foundation import NSRunLoop, NSDate
+            initial_n = len(self._sfs_segments)
             deadline = time.monotonic() + 0.6
-            while self._final_text is None and time.monotonic() < deadline:
+            while len(self._sfs_segments) == initial_n and time.monotonic() < deadline:
                 NSRunLoop.currentRunLoop().runUntilDate_(
                     NSDate.dateWithTimeIntervalSinceNow_(0.03))
         except ImportError:
             pass
 
-        text = self._final_text if self._final_text is not None else self.live_text
+        # Assemble final text. Prefer finalized segments; fall back to
+        # the most recent partial if the last segment didn't finalize
+        # in time.
+        pieces = list(self._sfs_segments)
+        if self._sfs_current_partial and (not pieces or pieces[-1] != self._sfs_current_partial):
+            pieces.append(self._sfs_current_partial)
+        text = " ".join(pieces).strip()
 
         # Cleanup
         if self._sfs_task is not None:
@@ -957,8 +1056,11 @@ class AudioRecorderDaemon:
             self._sfs_task = None
         self._sfs_request = None
         self._sfs_recognizer = None
+        self._sfs_handler = None
+        self._sfs_segments = []
+        self._sfs_current_partial = ""
 
-        logger.info(f"Apple streaming transcript: {len(text or '')} chars")
+        logger.info(f"Apple streaming transcript: {len(text)} chars")
         return text or None
 
     def _cleanup_temp_files(self) -> None:
