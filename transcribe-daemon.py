@@ -920,65 +920,13 @@ class AudioRecorderDaemon:
         # The audio tap continues flowing into whichever request is
         # currently installed.
         def handler(result, err):
-            if self._sfs_stopped:
-                return
-            if err is not None:
-                msg = str(err)
-                logger.info(f"[sfs] handler err: {msg[:120]} — chaining")
-                self._start_next_sfs_segment()
-                return
-            if result is None:
-                return
-            text = str(result.bestTranscription().formattedString())
-            is_final = bool(result.isFinal())
-            prev = self._sfs_current_partial
-
-            # Apple doesn't always fire isFinal on short pauses; sometimes
-            # it just silently restarts the utterance and the next partial
-            # begins a fresh, shorter transcription. Detect that by
-            # watching for the partial to shrink or replace its head, and
-            # promote the previous partial into a finalized segment so we
-            # don't lose what the user already said.
-            if prev and not is_final:
-                shrank_a_lot = len(text) < max(3, len(prev) // 2)
-                head_changed = len(prev) > 15 and text[:10].lower() != prev[:10].lower()
-                if shrank_a_lot or head_changed:
-                    logger.info(f"[sfs] utterance restart detected; promoting partial to segment: {prev!r}")
-                    self._sfs_segments.append(prev)
-
-            # Apple often re-transcribes the whole session later and
-            # delivers a partial/final that already contains the earlier
-            # phrases. When that happens the text starts with the (word-
-            # normalized) concatenation of our leading segments — drop
-            # those segments so we don't double-count the content. Uses
-            # word-level equality so punctuation changes across passes
-            # ("OK, nice" vs "OK nice") don't break the match.
-            new_words = _sfs_norm_words(text)
-            accum_len = 0
-            n_drop = 0
-            for i, seg in enumerate(self._sfs_segments):
-                sw = _sfs_norm_words(seg)
-                if not sw:
-                    continue
-                if new_words[accum_len:accum_len + len(sw)] == sw:
-                    accum_len += len(sw)
-                    n_drop = i + 1
-                else:
-                    break
-            if n_drop > 0:
-                logger.info(f"[sfs] new text subsumes {n_drop} prior segment(s); dropping")
-                self._sfs_segments = self._sfs_segments[n_drop:]
-
-            self._sfs_current_partial = text
-            full = (" ".join(self._sfs_segments) + " " + text).strip()
-            self.live_text = full
-            update_status("recording", live_text=full)
-            if is_final:
-                logger.info(f"[sfs] segment final ({len(text)} chars): {text!r} — chaining")
-                if text:
-                    self._sfs_segments.append(text)
-                self._sfs_current_partial = ""
-                self._start_next_sfs_segment()
+            # All callback work is wrapped so an unexpected exception
+            # doesn't kill the recognizer and leave the daemon in a
+            # half-broken state that looks like "nothing happens."
+            try:
+                self._sfs_handle(result, err)
+            except Exception as exc:
+                logger.error(f"[sfs] handler crashed: {exc!r}", exc_info=True)
 
         self._sfs_handler = handler
 
@@ -1021,6 +969,102 @@ class AudioRecorderDaemon:
         send_notification("🎤 Streaming...")
         update_status("recording", live_text="")
         return True
+
+    def _sfs_handle(self, result, err) -> None:
+        """Process one SFSpeechRecognizer callback (partial or final).
+
+        Key invariants this function maintains:
+        - ``self._sfs_segments`` holds the finalized, deduplicated
+          history of what the user has said so far.
+        - ``self._sfs_current_partial`` holds the most recent partial
+          transcription from the CURRENT task only.
+        - ``self.live_text`` is always segments joined + current_partial,
+          and is the thing the overlay shows.
+
+        Two classes of edge case live here:
+
+        1. Apple silently restarts an utterance without firing isFinal.
+           Symptom: the next partial is much shorter than the previous
+           (or has a different head). We promote the previous partial
+           into segments so it isn't lost.
+
+        2. Apple later re-transcribes and delivers a partial/final that
+           already contains earlier segments. Symptom: the new word
+           tokens start with the concatenation of one or more segments.
+           We drop those leading segments so we don't double-count.
+
+        And one more: Apple sometimes fires isFinal with EMPTY text
+        (happens when a chained task gets finalized before receiving
+        any audio). If we blindly cleared current_partial on every
+        final, we'd lose the user's speech. So on empty finals, we
+        promote the existing partial into segments instead of clobbering.
+        """
+        if self._sfs_stopped:
+            return
+        if err is not None:
+            msg = str(err)
+            # 1110 = "No speech detected" — expected when there's a long
+            # silence. Log at info so it's findable but not alarming.
+            logger.info(f"[sfs] handler err: {msg[:120]} — chaining")
+            self._start_next_sfs_segment()
+            return
+        if result is None:
+            return
+
+        text = str(result.bestTranscription().formattedString())
+        is_final = bool(result.isFinal())
+        prev = self._sfs_current_partial
+
+        # --- 1. Detect utterance restart (Apple silently began a new
+        #        utterance; previous partial must be promoted).
+        if prev and not is_final:
+            shrank_a_lot = len(text) < max(3, len(prev) // 2)
+            head_changed = len(prev) > 15 and text[:10].lower() != prev[:10].lower()
+            if shrank_a_lot or head_changed:
+                logger.info(f"[sfs] utterance restart; promoting partial to segment: {prev!r}")
+                self._sfs_segments.append(prev)
+                prev = ""
+
+        # --- 2. Detect subsumption (new text contains leading segments)
+        new_words = _sfs_norm_words(text)
+        accum_len = 0
+        n_drop = 0
+        for i, seg in enumerate(self._sfs_segments):
+            sw = _sfs_norm_words(seg)
+            if not sw:
+                continue
+            if new_words[accum_len:accum_len + len(sw)] == sw:
+                accum_len += len(sw)
+                n_drop = i + 1
+            else:
+                break
+        if n_drop > 0:
+            logger.info(f"[sfs] new text subsumes {n_drop} prior segment(s); dropping")
+            self._sfs_segments = self._sfs_segments[n_drop:]
+
+        # --- 3. Finalize or update partial
+        if is_final:
+            # An empty final means the current task wrapped up without
+            # hearing speech. Promote `prev` (if any) instead of
+            # overwriting with "" and losing what the user said.
+            content = text if text else prev
+            if content:
+                logger.info(f"[sfs] segment final ({len(content)} chars): {content!r}")
+                self._sfs_segments.append(content)
+            else:
+                logger.info("[sfs] empty final (no prev either); nothing promoted")
+            self._sfs_current_partial = ""
+            full = " ".join(self._sfs_segments).strip()
+            self.live_text = full
+            update_status("recording", live_text=full)
+            self._start_next_sfs_segment()
+            return
+
+        # Non-final partial path: update partial + live text
+        self._sfs_current_partial = text
+        full = (" ".join(self._sfs_segments) + " " + text).strip()
+        self.live_text = full
+        update_status("recording", live_text=full)
 
     def _start_next_sfs_segment(self) -> None:
         """Start a fresh SFSpeech request+task after the previous one
@@ -1469,22 +1513,41 @@ class TranscriptionDaemon:
         """Stop recording and process."""
         logger.info("stop_and_process called")
         self.last_activity_time = time.time()  # Update activity time
-        result = self.recorder.stop_recording()
-        if not result:
+        try:
+            result = self.recorder.stop_recording()
+        except Exception as exc:
+            logger.error(f"stop_recording crashed: {exc!r}", exc_info=True)
+            update_status("idle")   # don't leave the overlay stuck
             return
+
         if ENGINE == "apple-streaming":
-            # Streaming engines return the transcript directly; skip the
-            # VAD/normalize/parakeet pipeline entirely.
-            logger.info("Streaming result — skipping batch pipeline")
-            self.pipeline.post_transcribe(result)
-            logger.info("Processing complete")
+            # `result` is the text (or None) for streaming engines, not
+            # a WAV path. ALWAYS call post_transcribe — it handles empty
+            # text correctly (notifies + updates status to idle). The
+            # earlier early-return on falsy result was the reason the
+            # pill would get stuck on "Recording" when Apple heard
+            # nothing.
+            try:
+                self.pipeline.post_transcribe(result or "")
+            except Exception as exc:
+                logger.error(f"post_transcribe crashed: {exc!r}", exc_info=True)
+                update_status("idle")
+            logger.info("Processing complete (streaming)")
             return
-        else:
-            with self._audio_lock:
-                self._current_audio_file = result
-            logger.info("Processing audio synchronously...")
+
+        # Batch engines: result is a WAV path, empty means nothing to do.
+        if not result:
+            update_status("idle")
+            return
+        with self._audio_lock:
+            self._current_audio_file = result
+        logger.info("Processing audio synchronously...")
+        try:
             self._process_audio()
-            logger.info("Processing complete")
+        except Exception as exc:
+            logger.error(f"_process_audio crashed: {exc!r}", exc_info=True)
+            update_status("idle")
+        logger.info("Processing complete")
 
     def is_idle_timeout_exceeded(self) -> bool:
         """Check if daemon has been idle too long."""
