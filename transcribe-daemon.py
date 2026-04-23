@@ -842,6 +842,7 @@ class AudioRecorderDaemon:
                 SFSpeechRecognizerAuthorizationStatusNotDetermined,
                 SFSpeechRecognizerAuthorizationStatusDenied,
                 SFSpeechRecognizerAuthorizationStatusRestricted,
+                SFSpeechRecognitionTaskHintDictation,
             )
             from AVFoundation import AVAudioEngine
         except ImportError as exc:
@@ -914,23 +915,35 @@ class AudioRecorderDaemon:
             if self._sfs_stopped:
                 return
             if err is not None:
-                # kAFAssistantErrorDomain 1110 = "No speech detected" —
-                # expected for long silences. Not fatal; the next
-                # segment (if any) will pick up on the next utterance.
                 msg = str(err)
-                if "1110" not in msg and "No speech" not in msg:
-                    logger.warning(f"Speech recognition error: {err}")
-                # Trigger a fresh segment if we're still active.
+                logger.info(f"[sfs] handler err: {msg[:120]} — chaining")
                 self._start_next_sfs_segment()
                 return
             if result is None:
                 return
             text = str(result.bestTranscription().formattedString())
+            is_final = bool(result.isFinal())
+            prev = self._sfs_current_partial
+
+            # Apple doesn't always fire isFinal on short pauses; sometimes
+            # it just silently restarts the utterance and the next partial
+            # begins a fresh, shorter transcription. Detect that by
+            # watching for the partial to shrink or replace its head, and
+            # promote the previous partial into a finalized segment so we
+            # don't lose what the user already said.
+            if prev and not is_final:
+                shrank_a_lot = len(text) < max(3, len(prev) // 2)
+                head_changed = len(prev) > 15 and text[:10].lower() != prev[:10].lower()
+                if shrank_a_lot or head_changed:
+                    logger.info(f"[sfs] utterance restart detected; promoting partial to segment: {prev!r}")
+                    self._sfs_segments.append(prev)
+
             self._sfs_current_partial = text
             full = (" ".join(self._sfs_segments) + " " + text).strip()
             self.live_text = full
             update_status("recording", live_text=full)
-            if bool(result.isFinal()):
+            if is_final:
+                logger.info(f"[sfs] segment final ({len(text)} chars): {text!r} — chaining")
                 if text:
                     self._sfs_segments.append(text)
                 self._sfs_current_partial = ""
@@ -940,6 +953,9 @@ class AudioRecorderDaemon:
 
         req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
         req.setShouldReportPartialResults_(True)
+        # Hint dictation so Apple segments on natural pauses.
+        if hasattr(req, "setTaskHint_"):
+            req.setTaskHint_(SFSpeechRecognitionTaskHintDictation)
         if hasattr(req, "setRequiresOnDeviceRecognition_"):
             req.setRequiresOnDeviceRecognition_(True)
         if hasattr(req, "setAddsPunctuation_"):
@@ -981,11 +997,16 @@ class AudioRecorderDaemon:
         if self._sfs_stopped or self._sfs_recognizer is None:
             return
         try:
-            from Speech import SFSpeechAudioBufferRecognitionRequest
+            from Speech import (
+                SFSpeechAudioBufferRecognitionRequest,
+                SFSpeechRecognitionTaskHintDictation,
+            )
         except ImportError:
             return
         req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
         req.setShouldReportPartialResults_(True)
+        if hasattr(req, "setTaskHint_"):
+            req.setTaskHint_(SFSpeechRecognitionTaskHintDictation)
         if hasattr(req, "setRequiresOnDeviceRecognition_"):
             req.setRequiresOnDeviceRecognition_(True)
         if hasattr(req, "setAddsPunctuation_"):
@@ -993,6 +1014,7 @@ class AudioRecorderDaemon:
         self._sfs_request = req
         self._sfs_task = self._sfs_recognizer.recognitionTaskWithRequest_resultHandler_(
             req, self._sfs_handler)
+        logger.info(f"[sfs] started new segment (segments so far: {len(self._sfs_segments)})")
 
     def _stop_recording_apple_streaming(self) -> Optional[str]:
         """Finalize the streaming recognition and return the text.
