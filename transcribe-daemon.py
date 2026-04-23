@@ -1053,16 +1053,18 @@ class AudioRecorderDaemon:
         Unlike the batch recorders this doesn't return a file path — it
         returns the transcript directly and stop_and_process knows to
         skip the pipeline.
+
+        Important ordering: DO NOT set _sfs_stopped before calling
+        endAudio and waiting for the isFinal callback. If we did, the
+        handler would early-return on the very final that contains the
+        last word the user said, and we'd paste the previous partial
+        (missing the last word). Only flip _sfs_stopped after we've
+        collected the final.
         """
         logger.info("Stopping recording (Apple streaming)...")
         self.is_recording = False
-        # Flip this before endAudio so any late handler callbacks (incl.
-        # isFinal from the last segment) are ignored and don't re-write
-        # state=recording onto the status JSON after we've moved on.
-        self._sfs_stopped = True
 
-        # Give the user a brief tail so the last word isn't clipped,
-        # but much shorter than the batch delay — streaming is live.
+        # Give the user a brief tail so the last word reaches the tap.
         time.sleep(min(TRAILING_SPEECH_DELAY, 0.3))
 
         if self._av_engine is not None:
@@ -1080,17 +1082,34 @@ class AudioRecorderDaemon:
             except Exception as exc:
                 logger.warning(f"endAudio raised: {exc}")
 
-        # Wait briefly for the last segment's isFinal to land so we can
-        # include the most recent partial as a finalized segment.
+        # Wait for the handler to receive the final isFinal callback
+        # (which contains the last word Apple heard after endAudio
+        # processed the tail of the audio). The handler appends to
+        # segments when isFinal fires — watch for that, OR for the
+        # current_partial to grow, as a signal we got the final update.
         try:
             from Foundation import NSRunLoop, NSDate
-            initial_n = len(self._sfs_segments)
-            deadline = time.monotonic() + 0.6
-            while len(self._sfs_segments) == initial_n and time.monotonic() < deadline:
+            initial_seg_n = len(self._sfs_segments)
+            initial_partial_len = len(self._sfs_current_partial)
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
                 NSRunLoop.currentRunLoop().runUntilDate_(
                     NSDate.dateWithTimeIntervalSinceNow_(0.03))
+                grew_segments = len(self._sfs_segments) > initial_seg_n
+                grew_partial = len(self._sfs_current_partial) > initial_partial_len
+                if grew_segments or grew_partial:
+                    # Give a brief settle window for any follow-up final
+                    # that subsumes the grown partial.
+                    settle = time.monotonic() + 0.15
+                    while time.monotonic() < settle:
+                        NSRunLoop.currentRunLoop().runUntilDate_(
+                            NSDate.dateWithTimeIntervalSinceNow_(0.03))
+                    break
         except ImportError:
             pass
+
+        # NOW block any further late callbacks from writing status JSON.
+        self._sfs_stopped = True
 
         # Assemble final text. Prefer finalized segments; fall back to
         # the most recent partial if the last segment didn't finalize
