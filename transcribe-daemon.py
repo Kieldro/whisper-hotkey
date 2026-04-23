@@ -111,6 +111,14 @@ VALID_COMPUTE_TYPES = {
 VALID_ENGINES = {"whisper", "parakeet", "apple-streaming"}
 
 
+# Word tokenizer used by the apple-streaming subsumption check. Word-level
+# comparison survives the minor punctuation changes Apple makes between
+# transcription passes ("OK, nice" vs "OK nice.").
+_SFS_WORD_RE = re.compile(r"[a-zA-Z0-9]+")
+def _sfs_norm_words(s: str) -> list:
+    return _SFS_WORD_RE.findall(s.lower())
+
+
 def validate_config() -> None:
     """Validate all config values at startup. Exit with clear error on invalid values."""
     errors = []
@@ -937,6 +945,29 @@ class AudioRecorderDaemon:
                 if shrank_a_lot or head_changed:
                     logger.info(f"[sfs] utterance restart detected; promoting partial to segment: {prev!r}")
                     self._sfs_segments.append(prev)
+
+            # Apple often re-transcribes the whole session later and
+            # delivers a partial/final that already contains the earlier
+            # phrases. When that happens the text starts with the (word-
+            # normalized) concatenation of our leading segments — drop
+            # those segments so we don't double-count the content. Uses
+            # word-level equality so punctuation changes across passes
+            # ("OK, nice" vs "OK nice") don't break the match.
+            new_words = _sfs_norm_words(text)
+            accum_len = 0
+            n_drop = 0
+            for i, seg in enumerate(self._sfs_segments):
+                sw = _sfs_norm_words(seg)
+                if not sw:
+                    continue
+                if new_words[accum_len:accum_len + len(sw)] == sw:
+                    accum_len += len(sw)
+                    n_drop = i + 1
+                else:
+                    break
+            if n_drop > 0:
+                logger.info(f"[sfs] new text subsumes {n_drop} prior segment(s); dropping")
+                self._sfs_segments = self._sfs_segments[n_drop:]
 
             self._sfs_current_partial = text
             full = (" ".join(self._sfs_segments) + " " + text).strip()
