@@ -23,6 +23,7 @@ from AppKit import (
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSEvent,
     NSViewWidthSizable, NSViewHeightSizable,
+    NSLineBreakByTruncatingHead,
 )
 from Foundation import NSObject, NSNumber
 from Quartz import CGColorCreateGenericRGB, CABasicAnimation
@@ -51,6 +52,7 @@ DOT_TO_LABEL_GAP = 9.0
 FONT_POINT_SIZE = 13.0
 EDGE_MARGIN = 12.0
 MENU_BAR_CLEARANCE = 40.0          # menu bar is ~24pt; leave breathing room
+MAX_LABEL_WIDTH = 520.0            # cap on live-transcript width; truncate past this
 
 
 class StatusOverlay(NSObject):
@@ -107,22 +109,31 @@ class StatusOverlay(NSObject):
         self.label.setAlignment_(NSTextAlignmentLeft)
         self.label.setFont_(NSFont.systemFontOfSize_weight_(FONT_POINT_SIZE, NSFontWeightSemibold))
         self.label.setTextColor_(NSColor.whiteColor())
+        # Truncate from the left when live text exceeds MAX_LABEL_WIDTH so
+        # the most recent words stay visible as the user dictates.
+        self.label.cell().setLineBreakMode_(NSLineBreakByTruncatingHead)
         self.label.setStringValue_("")
         self.blur.addSubview_(self.label)
 
         self.current_state = None
+        self.current_live_text = ""
         self.hide_timer = None
         return self
 
     def tick_(self, timer):
+        state = None
+        live_text = ""
         try:
             with open(STATUS_FILE) as f:
-                state = json.load(f).get("state", "idle")
+                data = json.load(f)
+            state = data.get("state", "idle")
+            live_text = data.get("live_text", "") or ""
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             state = None
-        if state != self.current_state:
+        if state != self.current_state or live_text != self.current_live_text:
             self.current_state = state
-            self._render(state)
+            self.current_live_text = live_text
+            self._render(state, live_text)
 
     def autoHide_(self, timer):
         self.hide_timer = None
@@ -130,20 +141,22 @@ class StatusOverlay(NSObject):
             self.window.orderOut_(None)
 
     @objc.python_method
-    def _render(self, state):
+    def _render(self, state, live_text=""):
         if state is None:
             if self.window.isVisible():
                 self.window.orderOut_(None)
             return
         label, (r, g, b), pulses = STATE_CONFIG.get(state, STATE_CONFIG["idle"])
-        self.label.setStringValue_(label)
-        # Size label to its natural width, then resize the whole pill.
+        # If we have live transcript text, show that instead of the state
+        # label (streaming engines stay in "recording" state but fill the
+        # pill with partials as they arrive).
+        display_text = live_text if live_text else label
+        self.label.setStringValue_(display_text)
+        # Size label to its natural width, then cap at MAX_LABEL_WIDTH.
         self.label.sizeToFit()
-        text_w = self.label.frame().size.width
+        text_w = min(self.label.frame().size.width, MAX_LABEL_WIDTH)
         label_x = SIDE_PAD + DOT_SIZE + DOT_TO_LABEL_GAP
         pill_w = label_x + text_w + SIDE_PAD
-        # Center label vertically: sizeToFit returns a shrink-wrapped rect,
-        # so we need to set its y so the text baseline looks centered.
         label_frame = self.label.frame()
         self.label.setFrame_(NSMakeRect(label_x,
                                         (HEIGHT - label_frame.size.height) / 2,

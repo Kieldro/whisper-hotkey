@@ -108,7 +108,7 @@ VALID_COMPUTE_TYPES = {
 }
 
 
-VALID_ENGINES = {"whisper", "parakeet"}
+VALID_ENGINES = {"whisper", "parakeet", "apple-streaming"}
 
 
 def validate_config() -> None:
@@ -698,6 +698,13 @@ class AudioRecorderDaemon:
         self.process: Optional[subprocess.Popen] = None
         self.output_file: Optional[str] = None
         self._av_recorder = None
+        # Apple streaming state
+        self._av_engine = None
+        self._sfs_request = None
+        self._sfs_task = None
+        self._sfs_recognizer = None
+        self.live_text: str = ""
+        self._final_text: Optional[str] = None
 
     def start_recording(self) -> bool:
         """Start recording. Returns True on success."""
@@ -705,6 +712,8 @@ class AudioRecorderDaemon:
             logger.warning("Already recording, ignoring start request")
             return False
         if IS_MACOS:
+            if ENGINE == "apple-streaming":
+                return self._start_recording_apple_streaming()
             return self._start_recording_macos()
         return self._start_recording_linux()
 
@@ -813,6 +822,145 @@ class AudioRecorderDaemon:
         update_status("recording")
         return True
 
+    def _start_recording_apple_streaming(self) -> bool:
+        """Start live streaming via SFSpeechRecognizer.
+
+        Pipes the AVAudioEngine input tap directly into
+        SFSpeechAudioBufferRecognitionRequest and updates self.live_text
+        from the result handler. On stop we return the final text;
+        stop_and_process treats this engine as "already transcribed" and
+        skips the batch pipeline (VAD → normalize → parakeet/whisper).
+        """
+        try:
+            from Speech import (
+                SFSpeechRecognizer,
+                SFSpeechAudioBufferRecognitionRequest,
+                SFSpeechRecognizerAuthorizationStatusAuthorized,
+            )
+            from AVFoundation import AVAudioEngine
+        except ImportError as exc:
+            logger.error(f"Apple Speech framework unavailable: {exc}")
+            send_notification("❌ pyobjc-framework-Speech not installed")
+            return False
+
+        if SFSpeechRecognizer.authorizationStatus() != SFSpeechRecognizerAuthorizationStatusAuthorized:
+            logger.error("Speech Recognition not authorized")
+            send_notification("❌ Grant Speech Recognition permission in System Settings")
+            return False
+
+        recog = SFSpeechRecognizer.alloc().init()
+        if recog is None or not recog.isAvailable():
+            logger.error("SFSpeechRecognizer unavailable (Dictation enabled in System Settings?)")
+            send_notification("❌ Enable Dictation in System Settings → Keyboard")
+            return False
+
+        req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
+        req.setShouldReportPartialResults_(True)
+        if hasattr(req, "setRequiresOnDeviceRecognition_"):
+            req.setRequiresOnDeviceRecognition_(True)
+        if hasattr(req, "setAddsPunctuation_"):
+            req.setAddsPunctuation_(True)
+
+        self.live_text = ""
+        self._final_text = None
+
+        def handler(result, err):
+            if err is not None:
+                # kAFAssistantErrorDomain code 1110 = "No speech detected";
+                # common if user presses stop quickly or stays silent.
+                logger.warning(f"Speech recognition error: {err}")
+                return
+            if result is None:
+                return
+            text = str(result.bestTranscription().formattedString())
+            self.live_text = text
+            update_status("recording", live_text=text)
+            if bool(result.isFinal()):
+                self._final_text = text
+                logger.info(f"Streaming final: {len(text)} chars")
+
+        self._sfs_recognizer = recog
+        self._sfs_request = req
+        self._sfs_task = recog.recognitionTaskWithRequest_resultHandler_(req, handler)
+
+        engine = AVAudioEngine.alloc().init()
+        inp = engine.inputNode()
+        fmt = inp.outputFormatForBus_(0)
+
+        def tap(buf, when):
+            req.appendAudioPCMBuffer_(buf)
+
+        inp.installTapOnBus_bufferSize_format_block_(0, 1024, fmt, tap)
+        ok, err = engine.startAndReturnError_(None)
+        if not ok:
+            logger.error(f"AVAudioEngine start failed: {err}")
+            self._sfs_task.cancel()
+            self._sfs_task = None
+            return False
+
+        self._av_engine = engine
+        self.is_recording = True
+        self.recording_start_time = time.time()
+        logger.info("Recording started (Apple streaming)")
+        play_sound(SOUND_START)
+        send_notification("🎤 Streaming...")
+        update_status("recording", live_text="")
+        return True
+
+    def _stop_recording_apple_streaming(self) -> Optional[str]:
+        """Finalize the streaming recognition and return the text.
+
+        Unlike the batch recorders this doesn't return a file path — it
+        returns the transcript directly and stop_and_process knows to
+        skip the pipeline.
+        """
+        logger.info("Stopping recording (Apple streaming)...")
+        self.is_recording = False
+
+        # Give the user a brief tail so the last word isn't clipped,
+        # but much shorter than the batch delay — streaming is live.
+        time.sleep(min(TRAILING_SPEECH_DELAY, 0.3))
+
+        if self._av_engine is not None:
+            try:
+                self._av_engine.stop()
+                self._av_engine.inputNode().removeTapOnBus_(0)
+            except Exception as exc:
+                logger.warning(f"AVAudioEngine stop raised: {exc}")
+            self._av_engine = None
+
+        if self._sfs_request is not None:
+            try:
+                self._sfs_request.endAudio()
+            except Exception as exc:
+                logger.warning(f"endAudio raised: {exc}")
+
+        # Wait briefly (up to 600 ms) for isFinal to land; otherwise use
+        # the last partial we saw.
+        try:
+            from Foundation import NSRunLoop, NSDate
+            deadline = time.monotonic() + 0.6
+            while self._final_text is None and time.monotonic() < deadline:
+                NSRunLoop.currentRunLoop().runUntilDate_(
+                    NSDate.dateWithTimeIntervalSinceNow_(0.03))
+        except ImportError:
+            pass
+
+        text = self._final_text if self._final_text is not None else self.live_text
+
+        # Cleanup
+        if self._sfs_task is not None:
+            try:
+                self._sfs_task.cancel()
+            except Exception:
+                pass
+            self._sfs_task = None
+        self._sfs_request = None
+        self._sfs_recognizer = None
+
+        logger.info(f"Apple streaming transcript: {len(text or '')} chars")
+        return text or None
+
     def _cleanup_temp_files(self) -> None:
         """Clean up any temp files created during recording."""
         if self.output_file and os.path.exists(self.output_file):
@@ -823,11 +971,14 @@ class AudioRecorderDaemon:
             self.output_file = None
 
     def stop_recording(self) -> Optional[str]:
-        """Stop recording and return file path."""
+        """Stop recording. Returns a WAV path for batch engines, or the
+        transcribed text directly for streaming engines."""
         if not self.is_recording:
             logger.warning("Not recording, ignoring stop request")
             return None
         if IS_MACOS:
+            if ENGINE == "apple-streaming":
+                return self._stop_recording_apple_streaming()
             return self._stop_recording_macos()
         return self._stop_recording_linux()
 
@@ -914,7 +1065,11 @@ class TranscriptionPipeline:
         logger.info(f"Initializing TranscriptionPipeline (engine={ENGINE}, model={WHISPER_MODEL}, device={DEVICE}, polishing={ENABLE_POLISHING})")
         self.engine = ENGINE
 
-        if self.engine == "parakeet":
+        if self.engine == "apple-streaming":
+            # No model to load — SFSpeechRecognizer runs inside AudioRecorderDaemon.
+            # Pipeline exists only to reuse post_transcribe() for clipboard + paste.
+            logger.info("Apple streaming engine — no batch model to load")
+        elif self.engine == "parakeet":
             logger.info("Loading Parakeet TDT model via onnx-asr...")
             import onnx_asr
             import onnxruntime as rt
@@ -985,7 +1140,15 @@ class TranscriptionPipeline:
             update_status("error", error=str(e)[:100])
             return ""
 
-        if not raw_text.strip():
+        return self.post_transcribe(raw_text)
+
+    def post_transcribe(self, raw_text: str) -> str:
+        """Everything that happens after we have transcribed text:
+        empty-check, spoken-punctuation, GPT polish, word replacements,
+        clipboard, auto-paste, shift-to-submit. Called by process() after
+        batch transcription; called directly by stop_and_process for
+        streaming engines that produce text without a WAV file."""
+        if not raw_text or not raw_text.strip():
             logger.warning("Transcription returned empty text")
             send_notification("No speech detected")
             update_status("idle")
@@ -1132,12 +1295,20 @@ class TranscriptionDaemon:
         """Stop recording and process."""
         logger.info("stop_and_process called")
         self.last_activity_time = time.time()  # Update activity time
-        audio_path = self.recorder.stop_recording()
-        if audio_path:
+        result = self.recorder.stop_recording()
+        if not result:
+            return
+        if ENGINE == "apple-streaming":
+            # Streaming engines return the transcript directly; skip the
+            # VAD/normalize/parakeet pipeline entirely.
+            logger.info("Streaming result — skipping batch pipeline")
+            self.pipeline.post_transcribe(result)
+            logger.info("Processing complete")
+            return
+        else:
             with self._audio_lock:
-                self._current_audio_file = audio_path
+                self._current_audio_file = result
             logger.info("Processing audio synchronously...")
-            # Process synchronously, not in background thread
             self._process_audio()
             logger.info("Processing complete")
 
@@ -1190,6 +1361,17 @@ def main():
     logger.info(f"Config: ENGINE={ENGINE}, ENABLE_POLISHING={ENABLE_POLISHING}, AUTO_PASTE={AUTO_PASTE}, MODEL={WHISPER_MODEL}")
 
     validate_config()
+
+    # SFSpeechRecognizer callbacks only fire when there is a pumped
+    # NSRunLoop backed by an NSApplication. Initialize early so the
+    # streaming engine works out of the box. Harmless for other engines.
+    if IS_MACOS:
+        try:
+            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+            _app = NSApplication.sharedApplication()
+            _app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        except ImportError:
+            pass
 
     if ENABLE_POLISHING and not os.getenv("OPENAI_API_KEY"):
         logger.error("OPENAI_API_KEY not set but polishing is enabled")
@@ -1387,10 +1569,19 @@ def main():
                 logger.info(f"Idle timeout exceeded ({daemon.idle_timeout}s), shutting down daemon")
                 break
 
-            # Wait for signals or timeout (efficient polling)
-            # 5ms gives near-instant signal response; ~200 wakeups/s is
-            # negligible on modern hardware for a long-running daemon.
-            shutdown_event.wait(timeout=0.005)
+            # Wait for signals or timeout (efficient polling).
+            # On macOS, pump the NSRunLoop so SFSpeechRecognizer callbacks
+            # fire during streaming. 5ms keeps signal response near-instant
+            # for the non-streaming engines too.
+            if IS_MACOS:
+                try:
+                    from Foundation import NSRunLoop, NSDate
+                    NSRunLoop.currentRunLoop().runUntilDate_(
+                        NSDate.dateWithTimeIntervalSinceNow_(0.005))
+                except ImportError:
+                    shutdown_event.wait(timeout=0.005)
+            else:
+                shutdown_event.wait(timeout=0.005)
 
         logger.info("Daemon loop exiting")
 
