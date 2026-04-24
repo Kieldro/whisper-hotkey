@@ -1664,9 +1664,10 @@ def main():
     logger.info(f"Acquired daemon lock, PID written to {daemon_lock_file}")
 
     # Launch status overlay — GTK on Linux, native AppKit on macOS.
-    # Use the same Python interpreter as the daemon (needed on macOS so the
-    # overlay picks up the venv's pyobjc; python3 on PATH won't have it).
+    # macOS: use venv python so the overlay picks up pyobjc.
+    # Linux: use system python3 so the overlay picks up system gi (GTK3).
     overlay_script = None
+    overlay_python = sys.executable if IS_MACOS else (shutil.which("python3") or sys.executable)
     if ENABLE_OVERLAY:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         candidate = os.path.join(
@@ -1681,7 +1682,7 @@ def main():
             return None
         try:
             p = subprocess.Popen(
-                [sys.executable, overlay_script],
+                [overlay_python, overlay_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -1796,10 +1797,14 @@ def main():
                 daemon.stop_and_process()
 
             # Keep the overlay alive: respawn if the user/test killed it.
+            # Cooldown prevents crash-loop spam if the overlay can't start.
             if overlay_script and (overlay_proc is None or overlay_proc.poll() is not None):
-                if overlay_proc is not None:
-                    logger.warning(f"Status overlay exited (code {overlay_proc.returncode}); respawning")
-                overlay_proc = spawn_overlay()
+                now = time.time()
+                if now - getattr(spawn_overlay, '_last_attempt', 0) >= 5.0:
+                    if overlay_proc is not None:
+                        logger.warning(f"Status overlay exited (code {overlay_proc.returncode}); respawning")
+                    spawn_overlay._last_attempt = now
+                    overlay_proc = spawn_overlay()
 
             # Check for idle timeout
             if daemon.is_idle_timeout_exceeded():
