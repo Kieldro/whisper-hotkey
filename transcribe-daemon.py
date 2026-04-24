@@ -73,6 +73,10 @@ except ValueError:
 ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
 ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
+# Comma-separated proper nouns / jargon the recognizer should expect.
+# Apple's SFSpeechRecognitionRequest.contextualStrings accepts these
+# as hints and reliably biases recognition toward them.
+VOCABULARY_HINTS = [s.strip() for s in os.getenv("VOCABULARY_HINTS", "Claude,Anthropic").split(",") if s.strip()]
 PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
 RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"
@@ -939,6 +943,8 @@ class AudioRecorderDaemon:
             req.setRequiresOnDeviceRecognition_(True)
         if hasattr(req, "setAddsPunctuation_"):
             req.setAddsPunctuation_(True)
+        if VOCABULARY_HINTS and hasattr(req, "setContextualStrings_"):
+            req.setContextualStrings_(VOCABULARY_HINTS)
         self._sfs_request = req
         self._sfs_task = recog.recognitionTaskWithRequest_resultHandler_(req, handler)
 
@@ -1086,6 +1092,8 @@ class AudioRecorderDaemon:
             req.setRequiresOnDeviceRecognition_(True)
         if hasattr(req, "setAddsPunctuation_"):
             req.setAddsPunctuation_(True)
+        if VOCABULARY_HINTS and hasattr(req, "setContextualStrings_"):
+            req.setContextualStrings_(VOCABULARY_HINTS)
         self._sfs_request = req
         self._sfs_task = self._sfs_recognizer.recognitionTaskWithRequest_resultHandler_(
             req, self._sfs_handler)
