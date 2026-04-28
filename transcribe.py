@@ -60,6 +60,7 @@ class AudioRecorder:
         self.process = subprocess.Popen(
             [
                 'parecord',
+                '--file-format=wav',
                 '--format=s16le',
                 f'--rate={self.sample_rate}',
                 '--channels=1',

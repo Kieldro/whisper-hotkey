@@ -153,8 +153,9 @@ def send_notification(message: str) -> None:
         return
     try:
         if IS_MACOS:
+            safe = message.replace('\\', '\\\\').replace('"', '\\"')
             subprocess.run(
-                ['osascript', '-e', f'display notification "{message}" with title "Voice Transcription"'],
+                ['osascript', '-e', f'display notification "{safe}" with title "Voice Transcription"'],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -798,6 +799,7 @@ class AudioRecorderDaemon:
             self.process = subprocess.Popen(
                 [
                     'parecord',
+                    '--file-format=wav',
                     '--format=s16le',
                     f'--rate={self.sample_rate}',
                     '--channels=1',
