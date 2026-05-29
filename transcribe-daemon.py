@@ -594,17 +594,52 @@ PASTE_CHAIN = _build_paste_chain()
 logger.info(f"Paste chain: {PASTE_CHAIN}")
 
 
-def _copy_to_clipboard(text: str) -> None:
-    """Copy text to clipboard (helper for clipboard-based paste methods)."""
+def _log_x_exhaustion_hint(stderr: str) -> None:
+    """If stderr shows X11 client exhaustion, log an actionable root-cause hint."""
+    if "Maximum number of clients reached" in stderr:
+        logger.error(
+            "X server is out of client connection slots — another app is likely leaking "
+            "X11 connections. Diagnose: lsof -U | grep -c 'X1 ' (256 = maxed). "
+            "Fix: restart the offending app (commonly an Electron app like Discord/Slack)."
+        )
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy text to clipboard (helper for clipboard-based paste methods). Returns True on success."""
+    if IS_MACOS:
+        cmd = ["pbcopy"]
+    elif SESSION_TYPE == "wayland":
+        cmd = ["wl-copy"]
+    else:
+        cmd = ["xclip", "-selection", "clipboard"]
+    # xclip/wl-copy fork and keep serving the selection, holding any inherited pipe open —
+    # capture_output would block run() until the timeout. Send stderr to a temp file (a file
+    # fd never blocks run()) so errors are still captured without hanging on success.
     try:
-        if IS_MACOS:
-            subprocess.run(["pbcopy"], input=text.encode(), timeout=2, check=False)
-        elif SESSION_TYPE == "wayland":
-            subprocess.run(["wl-copy"], input=text.encode(), timeout=2, check=False)
-        else:
-            subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), timeout=2, check=False)
+        with tempfile.TemporaryFile() as errf:
+            result = subprocess.run(cmd, input=text.encode(), timeout=2,
+                                    stdout=subprocess.DEVNULL, stderr=errf, check=False)
+            errf.seek(0)
+            stderr = errf.read().decode(errors="replace").strip()
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logger.debug(f"Clipboard copy failed: {e}")
+        logger.warning(f"Clipboard copy ({cmd[0]}) failed: {e}")
+        return False
+    if result.returncode != 0:
+        logger.warning(f"Clipboard copy ({cmd[0]}) failed (rc={result.returncode})"
+                       + (f": {stderr}" if stderr else ""))
+        _log_x_exhaustion_hint(stderr)
+        return False
+    return True
+
+
+def _run_paste_cmd(cmd: list) -> bool:
+    """Run a paste subprocess; on failure log its stderr and flag X11 exhaustion. Returns True on success."""
+    result = subprocess.run(cmd, timeout=5, capture_output=True, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip()
+        logger.warning(f"Paste command '{cmd[0]}' failed (rc={result.returncode}): {stderr}")
+        _log_x_exhaustion_hint(stderr)
+    return result.returncode == 0
 
 
 def _execute_paste(method: str, text: str) -> bool:
@@ -634,34 +669,18 @@ def _execute_paste(method: str, text: str) -> bool:
             return result.returncode == 0
 
     if method == "wtype":
-        result = subprocess.run(
-            ["wtype", "--", text],
-            timeout=5, capture_output=True, check=False,
-        )
-        return result.returncode == 0
+        return _run_paste_cmd(["wtype", "--", text])
 
     elif method == "ydotool-clipboard":
         _copy_to_clipboard(text)
-        result = subprocess.run(
-            ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
-            timeout=5, capture_output=True, check=False,
-        )
-        return result.returncode == 0
+        return _run_paste_cmd(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
 
     elif method == "xdotool-type":
-        result = subprocess.run(
-            ["xdotool", "type", "--clearmodifiers", "--delay", "0", text],
-            timeout=5, capture_output=True, check=False,
-        )
-        return result.returncode == 0
+        return _run_paste_cmd(["xdotool", "type", "--clearmodifiers", "--delay", "0", text])
 
     elif method == "xdotool-clipboard":
         _copy_to_clipboard(text)
-        result = subprocess.run(
-            ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-            timeout=5, capture_output=True, check=False,
-        )
-        return result.returncode == 0
+        return _run_paste_cmd(["xdotool", "key", "--clearmodifiers", "ctrl+v"])
 
     else:
         logger.warning(f"Unknown paste method: {method}")
@@ -687,7 +706,7 @@ def paste_text(text: str) -> tuple:
                 return (True, method)
             logger.debug(f"Paste method {method} failed, trying next")
         except Exception as e:
-            logger.debug(f"Paste method {method} raised {type(e).__name__}: {e}")
+            logger.warning(f"Paste method {method} raised {type(e).__name__}: {e}")
 
     logger.warning("All paste methods exhausted")
     return (False, "")
@@ -1410,8 +1429,10 @@ class TranscriptionPipeline:
 
         # Copy to clipboard
         logger.info("Copying to clipboard...")
-        _copy_to_clipboard(final_text)
-        logger.info("Copied to clipboard")
+        if _copy_to_clipboard(final_text):
+            logger.info("Copied to clipboard")
+        else:
+            logger.warning("Clipboard copy failed — text may not be available to paste")
 
         # Auto-paste if enabled
         if AUTO_PASTE:
