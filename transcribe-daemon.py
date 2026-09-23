@@ -1469,6 +1469,10 @@ class TranscriptionPipeline:
                 else:
                     subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    # --clearmodifiers re-presses the Shift that was held at paste time; if the
+                    # user already let go, it stays logically down and breaks later hotkeys.
+                    subprocess.run(['xdotool', 'keyup', 'Shift_L', 'Shift_R'],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             play_sound(SOUND_PASTE)
             send_notification(f"Pasted: {final_text[:50]}...")
