@@ -1469,10 +1469,14 @@ class TranscriptionPipeline:
                 else:
                     subprocess.run(['xdotool', 'key', '--clearmodifiers', 'Return'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    # --clearmodifiers re-presses the Shift that was held at paste time; if the
-                    # user already let go, it stays logically down and breaks later hotkeys.
-                    subprocess.run(['xdotool', 'keyup', 'Shift_L', 'Shift_R'],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # xdotool --clearmodifiers re-presses any modifier held when it started (Shift for
+            # shift-to-submit, Super from the hotkey). If the user let go meanwhile, that key
+            # stays logically down and breaks later shortcuts, so always release them all.
+            if not IS_MACOS and SESSION_TYPE != "wayland":
+                subprocess.run(['xdotool', 'keyup', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R',
+                                'Alt_L', 'Alt_R', 'Super_L', 'Super_R'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             play_sound(SOUND_PASTE)
             send_notification(f"Pasted: {final_text[:50]}...")
