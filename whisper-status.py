@@ -8,6 +8,12 @@ import json
 import os
 import sys
 
+# Native Wayland GTK3 can't position the overlay, keep it above, or stop the
+# compositor focusing it when shown, so it steals the paste. Use Xwayland,
+# where mutter honours those hints. Must be set before GTK initialises.
+if os.getenv("WAYLAND_DISPLAY") and os.getenv("DISPLAY"):
+    os.environ["GDK_BACKEND"] = "x11"
+
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
@@ -83,6 +89,9 @@ class StatusOverlay(Gtk.Window):
         self.set_skip_pager_hint(True)
         self.set_resizable(False)
         self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        # Never take keyboard focus, or the paste lands in the overlay
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
 
         # Transparency
         screen = self.get_screen()
