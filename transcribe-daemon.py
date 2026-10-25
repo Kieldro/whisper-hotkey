@@ -74,6 +74,7 @@ ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").low
 ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
 PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
+SUBMIT_DELAY = float(os.getenv("SUBMIT_DELAY")) if os.getenv("SUBMIT_DELAY") else None  # seconds between paste and shift-to-submit Enter
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
 RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"
 ENABLE_OVERLAY = os.getenv("ENABLE_OVERLAY", "true").lower() == "true"
@@ -207,11 +208,37 @@ def cleanup_status() -> None:
         logger.debug(f"Failed to remove status file: {e}")
 
 
+def _evdev_shift_held() -> bool:
+    """True if Left/Right Shift is down on any keyboard evdev node we can open."""
+    import fcntl
+    import glob
+    # EVIOCGKEY(len) = _IOC(_IOC_READ, 'E', 0x18, len): bitmask of keys currently down
+    key_bytes = 96  # KEY_MAX (0x2ff) / 8, rounded up
+    eviocgkey = (2 << 30) | (key_bytes << 16) | (ord('E') << 8) | 0x18
+    paths = set(glob.glob("/dev/input/by-id/*-event-kbd") + glob.glob("/dev/input/by-path/*-event-kbd"))
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        try:
+            state = fcntl.ioctl(fd, eviocgkey, bytes(key_bytes))
+        except OSError:
+            continue
+        finally:
+            os.close(fd)
+        for code in (42, 54):  # KEY_LEFTSHIFT, KEY_RIGHTSHIFT
+            if state[code // 8] & (1 << (code % 8)):
+                return True
+    return False
+
+
 def is_shift_held() -> bool:
     """Check if Shift is currently held.
 
     macOS: CGEventSourceFlagsState reads physical modifier key state directly.
-    Linux: reads X11 keymap directly.
+    Wayland: asks the keyboards' evdev nodes (EVIOCGKEY); needs read access to them.
+    X11: reads X11 keymap directly.
     """
     if IS_MACOS:
         try:
@@ -221,6 +248,10 @@ def is_shift_held() -> bool:
             return bool(flags & kCGEventFlagMaskShift)
         except Exception:
             return False
+    elif SESSION_TYPE == "wayland":
+        # XQueryKeymap only sees keys while an XWayland window has focus, so it reads
+        # "not held" almost everywhere. evdev reports the physical state regardless.
+        return _evdev_shift_held()
     else:
         try:
             x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
@@ -236,6 +267,36 @@ def is_shift_held() -> bool:
             return bool(sl or sr)
         except Exception:
             return False
+
+
+_shift_seen = threading.Event()
+_shift_watch_done = threading.Event()
+
+
+def start_shift_watch() -> None:
+    """Note whether Shift goes down at any point from hotkey-stop until paste.
+
+    Transcription can take seconds (cold start), so checking only at paste time misses a
+    Shift that was pressed together with the stop hotkey and released before the paste.
+    """
+    global _shift_seen, _shift_watch_done
+    _shift_watch_done.set()  # retire a watcher left running by a run that never pasted
+    seen, done = _shift_seen, _shift_watch_done = threading.Event(), threading.Event()
+
+    def watch():
+        while not done.is_set():
+            if is_shift_held():
+                seen.set()
+                return
+            time.sleep(0.05)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def finish_shift_watch() -> bool:
+    """Stop watching; True if Shift was seen since start_shift_watch()."""
+    _shift_watch_done.set()
+    return _shift_seen.is_set()
 
 
 # Detect session type for clipboard/typing
@@ -604,12 +665,15 @@ def _log_x_exhaustion_hint(stderr: str) -> None:
         )
 
 
-def _copy_to_clipboard(text: str) -> bool:
-    """Copy text to clipboard (helper for clipboard-based paste methods). Returns True on success."""
+def _copy_to_clipboard(text: str, primary: bool = False) -> bool:
+    """Copy text to clipboard (helper for clipboard-based paste methods). Returns True on success.
+
+    primary=True targets the Wayland PRIMARY selection instead (what VTE pastes on Shift+Insert).
+    """
     if IS_MACOS:
         cmd = ["pbcopy"]
     elif SESSION_TYPE == "wayland":
-        cmd = ["wl-copy"]
+        cmd = ["wl-copy", "--primary"] if primary else ["wl-copy"]
     else:
         cmd = ["xclip", "-selection", "clipboard"]
     # xclip/wl-copy fork and keep serving the selection, holding any inherited pipe open —
@@ -642,6 +706,70 @@ def _run_paste_cmd(cmd: list) -> bool:
     return result.returncode == 0
 
 
+# Some event around the stop hotkey can take focus off the target window for a few hundred
+# ms (seen on GNOME Wayland, mostly on the first dictation after a pause), so a paste sent
+# then is lost. Wayland has no API to ask who has focus; AT-SPI does. A helper is started
+# when recording stops (so gi is loaded by paste time), and on "go" waits until an app
+# window is active again, printing its name, or "timeout".
+_FOCUS_WAITER = """
+import sys, time
+import gi; gi.require_version('Atspi', '2.0'); from gi.repository import Atspi
+def active():
+    d = Atspi.get_desktop(0)
+    for i in range(d.get_child_count()):
+        a = d.get_child_at_index(i)
+        for j in range(min(a.get_child_count(), 30) if a else 0):
+            w = a.get_child_at_index(j)
+            try:
+                if w.get_state_set().contains(Atspi.StateType.ACTIVE):
+                    return f"{a.get_name()} | {w.get_name()[:60]}"
+            except Exception:
+                pass
+    return None
+active()  # warm up the accessibility connection
+sys.stdin.readline()
+start = time.time()
+while time.time() - start < 1.5:
+    name = active()
+    if name:
+        print(f"{name} (waited {time.time() - start:.2f}s)", flush=True)
+        sys.exit()
+    time.sleep(0.03)
+print("timeout", flush=True)
+"""
+_focus_waiter = None
+
+
+def start_focus_waiter() -> None:
+    """Spawn the focus helper early (Wayland only); see _FOCUS_WAITER."""
+    global _focus_waiter
+    if SESSION_TYPE != "wayland":
+        return
+    if _focus_waiter and _focus_waiter.poll() is None:
+        _focus_waiter.kill()
+    try:
+        _focus_waiter = subprocess.Popen(["/usr/bin/python3", "-c", _FOCUS_WAITER],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, text=True)
+    except OSError as e:
+        logger.debug(f"Focus waiter unavailable: {e}")
+        _focus_waiter = None
+
+
+def wait_for_focus() -> None:
+    """Block (max ~2s) until an app window has keyboard focus, so the paste key isn't lost."""
+    global _focus_waiter
+    proc, _focus_waiter = _focus_waiter, None
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        out, _ = proc.communicate("go\n", timeout=2.5)
+        logger.info(f"Focus before paste: {out.strip() or 'unknown'}")
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logger.info("Focus before paste: helper timed out")
+
+
 def _execute_paste(method: str, text: str) -> bool:
     """Execute a single paste method. Returns True on success."""
     if method == "macos-cgevent":
@@ -672,8 +800,13 @@ def _execute_paste(method: str, text: str) -> bool:
         return _run_paste_cmd(["wtype", "--", text])
 
     elif method == "ydotool-clipboard":
+        # Wayland gives no way to ask which app is focused, so use the one key that pastes
+        # everywhere: Shift+Insert. GTK/Chrome/Electron paste CLIPBOARD; VTE terminals
+        # (Ptyxis, gnome-terminal) paste PRIMARY, where Ctrl+V would just send ^V.
         _copy_to_clipboard(text)
-        return _run_paste_cmd(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
+        _copy_to_clipboard(text, primary=True)
+        wait_for_focus()
+        return _run_paste_cmd(["ydotool", "key", "42:1", "110:1", "110:0", "42:0"])
 
     elif method == "xdotool-type":
         return _run_paste_cmd(["xdotool", "type", "--clearmodifiers", "--delay", "0", text])
@@ -1436,8 +1569,9 @@ class TranscriptionPipeline:
 
         # Auto-paste if enabled
         if AUTO_PASTE:
-            # Capture shift state before paste (paste itself clears physical modifiers on some platforms)
-            submit_after_paste = is_shift_held()
+            # Shift seen since the stop hotkey, or held now (paste itself clears physical
+            # modifiers on some platforms, so read it before pasting)
+            submit_after_paste = finish_shift_watch() or is_shift_held()
             success, method_used = paste_text(final_text)
 
             if not success:
@@ -1446,7 +1580,10 @@ class TranscriptionPipeline:
             # If Shift is held during paste, press Enter to submit
             if submit_after_paste or (not IS_MACOS and is_shift_held()):
                 logger.info("Shift-to-submit: pressing Enter")
-                time.sleep(0.2)  # wait for paste to be processed by app
+                # Wait for the app to take the paste. On Wayland, VTE terminals fetch PRIMARY
+                # asynchronously, so an Enter sent 0.2s later could land before the text.
+                time.sleep(SUBMIT_DELAY if SUBMIT_DELAY is not None
+                           else (0.6 if SESSION_TYPE == "wayland" else 0.2))
                 if IS_MACOS:
                     try:
                         from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
@@ -1543,6 +1680,8 @@ class TranscriptionDaemon:
     def stop_and_process(self) -> None:
         """Stop recording and process."""
         logger.info("stop_and_process called")
+        start_shift_watch()
+        start_focus_waiter()
         self.last_activity_time = time.time()  # Update activity time
         try:
             result = self.recorder.stop_recording()
