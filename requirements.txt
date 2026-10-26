@@ -5,10 +5,8 @@ ctranslate2>=4.0.0  # Only needed for ENGINE=whisper (pin <=4.4.0 on Ubuntu 24.0
 # (1.21 has a HF symlink bug.)
 openai>=1.0.0
 python-dotenv
-sounddevice>=0.4.0  # macOS audio recording (replaces parecord)
-soundfile>=0.12.0   # WAV file writing for sounddevice
-numpy>=1.20.0       # Required by sounddevice
+numpy>=1.20.0       # Audio normalization and VAD trimming
 silero-vad>=5.1  # Optional: VAD trimming to prevent hallucinations on silence
 pyobjc-framework-Quartz; sys_platform == "darwin"  # macOS: CGEvent paste + shift-to-submit
-pyobjc-framework-AVFoundation; sys_platform == "darwin"  # macOS: AVAudioRecorder (replaces sounddevice)
+pyobjc-framework-AVFoundation; sys_platform == "darwin"  # macOS: AVAudioRecorder / AVAudioEngine recording
 pyobjc-framework-Speech; sys_platform == "darwin"        # macOS: SFSpeechRecognizer (ENGINE=apple-streaming)
