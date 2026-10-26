@@ -1595,11 +1595,15 @@ class TranscriptionDaemon:
 class SignalWaker:
     """Sleeps the main loop until a signal arrives or the timeout passes.
 
-    signal.set_wakeup_fd makes the C-level handler write to a pipe; on macOS
-    that pipe is a CFRunLoop source, so waiting also delivers SFSpeech callbacks.
+    signal.set_wakeup_fd makes the C-level handler write each signal number to
+    a pipe; on macOS that pipe is a CFRunLoop source, so waiting also delivers
+    SFSpeech callbacks. `received` keeps those numbers in arrival order: Python
+    runs pending handlers by signal number, so after a long C call a
+    start+stop pair would otherwise replay as stop+start.
     """
 
     def __init__(self):
+        self.received = collections.deque()
         self._r, w = os.pipe()
         os.set_blocking(self._r, False)
         os.set_blocking(w, False)
@@ -1623,10 +1627,13 @@ class SignalWaker:
 
     def _drain(self) -> None:
         try:
-            while os.read(self._r, 512):
-                pass
+            while data := os.read(self._r, 512):
+                self.received.extend(data)
         except BlockingIOError:
             pass
+
+    def drain(self) -> None:
+        self._drain()
 
     def wait(self, timeout: float) -> None:
         if self._cf is not None:
@@ -1696,12 +1703,12 @@ def main():
 
     # Install handlers before the lock publishes our PID: the hotkey wrapper
     # signals that PID directly, and an unhandled SIGUSR1/2 terminates us.
-    # Handlers only record the signal; logging from a signal handler is unsafe.
-    # Toggles queue in arrival order (SIGUSR2 = start, SIGUSR1 = stop).
-    toggles = collections.deque()
+    # SIGUSR2 = start, SIGUSR1 = stop. Their handlers do nothing: installing
+    # one is what makes Python write the signal to SignalWaker's pipe, which
+    # the main loop reads in arrival order.
     shutdown_event = threading.Event()
-    signal.signal(signal.SIGUSR2, lambda signum, _: toggles.append(signum))
-    signal.signal(signal.SIGUSR1, lambda signum, _: toggles.append(signum))
+    signal.signal(signal.SIGUSR2, lambda *_: None)
+    signal.signal(signal.SIGUSR1, lambda *_: None)
     signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
     signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
 
@@ -1802,7 +1809,8 @@ def main():
             stop_chime()
 
         # Drop presses made while the model was loading (impatient extra presses)
-        toggles.clear()
+        waker.drain()
+        waker.received.clear()
         # Re-create state file in case a press during loading deleted it
         Path(state_file).touch()
 
@@ -1823,11 +1831,13 @@ def main():
         logger.info("Daemon loop started, model loaded and ready")
 
         while not shutdown_event.is_set():
-            while toggles and not shutdown_event.is_set():
-                if toggles.popleft() == signal.SIGUSR2:
+            waker.drain()
+            while waker.received and not shutdown_event.is_set():
+                sig = waker.received.popleft()
+                if sig == signal.SIGUSR2:
                     logger.info("Received start recording signal")
                     start_recording()
-                else:
+                elif sig == signal.SIGUSR1:
                     logger.info("Received stop recording signal")
                     daemon.stop_and_process()
 
