@@ -1814,11 +1814,13 @@ def main():
 
     waker = SignalWaker()
     overlay_proc = None
+    overlay_started = 0.0
+    overlay_crashes = 0  # consecutive exits within 5s of launch
     daemon = None
     # Everything after the lock sits inside try/finally so a model-load
     # failure still kills the overlay and releases the lock and state file.
     try:
-        overlay_proc = spawn_overlay()
+        overlay_proc, overlay_started = spawn_overlay(), time.monotonic()
 
         # Create state file immediately so extra presses during load send STOP (not START)
         Path(state_file).touch()
@@ -1875,11 +1877,16 @@ def main():
                     pass
                 daemon.stop_and_process()
 
-            # Keep the overlay alive: respawn if the user/test killed it.
-            if overlay_script and (overlay_proc is None or overlay_proc.poll() is not None):
-                if overlay_proc is not None:
-                    logger.warning(f"Status overlay exited (code {overlay_proc.returncode}); respawning")
-                overlay_proc = spawn_overlay()
+            # Keep the overlay alive if the user/test killed it, but don't
+            # respawn one that crashes on launch every 0.5s forever.
+            if overlay_proc is not None and overlay_proc.poll() is not None:
+                overlay_crashes = overlay_crashes + 1 if time.monotonic() - overlay_started < 5 else 0
+                logger.warning(f"Status overlay exited (code {overlay_proc.returncode})")
+                overlay_proc = None
+                if overlay_crashes < 3:
+                    overlay_proc, overlay_started = spawn_overlay(), time.monotonic()
+                else:
+                    logger.error("Status overlay keeps crashing on launch; not respawning")
 
             # Check for idle timeout
             if not daemon.recorder.is_recording and daemon.is_idle_timeout_exceeded():
