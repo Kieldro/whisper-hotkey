@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Floating status overlay for whisper-hotkey on macOS (AppKit / pyobjc).
 
-A compact HUD pill in the top-right of the screen the cursor is on.
+A compact HUD pill at the top center of the screen the cursor is on.
 Dark translucent blur base, bright colored state dot on the left, clean
 SF Pro label on the right. Designed to read as "native macOS HUD" the
 way Focus / Do-Not-Disturb and screen-recording indicators do.
@@ -34,6 +34,10 @@ STATUS_FILE = os.path.join(
     os.getenv("TMPDIR", "/tmp").rstrip("/"),
     "whisper-hotkey-status.json",
 )
+
+# The daemon spawns us; once it's gone we'd keep showing its last state.
+PARENT_PID = os.getppid()
+AUTO_HIDE_STATES = ("idle", "error")
 
 # state -> (label, bright dot color, pulse bool)
 STATE_CONFIG = {
@@ -120,6 +124,9 @@ class StatusOverlay(NSObject):
         return self
 
     def tick_(self, timer):
+        if os.getppid() != PARENT_PID:
+            NSApplication.sharedApplication().terminate_(None)
+            return
         state = None
         live_text = ""
         try:
@@ -136,7 +143,7 @@ class StatusOverlay(NSObject):
 
     def autoHide_(self, timer):
         self.hide_timer = None
-        if self.current_state == "idle":
+        if self.current_state in AUTO_HIDE_STATES:
             self.window.orderOut_(None)
 
     @objc.python_method
@@ -188,14 +195,14 @@ class StatusOverlay(NSObject):
         if self.hide_timer is not None:
             self.hide_timer.invalidate()
             self.hide_timer = None
-        if state == "idle":
+        if state in AUTO_HIDE_STATES:
             self.hide_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 3.0, self, "autoHide:", None, False,
             )
 
     @objc.python_method
     def _reposition(self):
-        """Put the pill in the top-right of the screen the mouse is on.
+        """Put the pill at the top center of the screen the mouse is on.
 
         NSScreen.mainScreen() is unreliable in a headless LSUIElement
         process — with multiple monitors it can return any of them. The

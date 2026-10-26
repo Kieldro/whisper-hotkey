@@ -18,6 +18,10 @@ STATUS_FILE = os.path.join(
     "whisper-hotkey-status.json"
 )
 
+# The daemon spawns us; once it's gone we'd keep showing its last state.
+PARENT_PID = os.getppid()
+AUTO_HIDE_STATES = ("idle", "error")
+
 # State -> (icon, label, css_class)
 STATE_CONFIG = {
     "recording":    ("\U0001f534", "REC", "recording"),
@@ -180,6 +184,9 @@ class StatusOverlay(Gtk.Window):
             self._custom_position = (x, y)
 
     def _poll_status(self):
+        if os.getppid() != PARENT_PID:
+            Gtk.main_quit()
+            return False
         try:
             with open(STATUS_FILE, "r") as f:
                 data = json.load(f)
@@ -222,13 +229,13 @@ class StatusOverlay(Gtk.Window):
 
         self._position_window()
 
-        # Auto-hide after 3s when idle
-        if state == "idle":
+        # Auto-hide after 3s when idle (or after an error)
+        if state in AUTO_HIDE_STATES:
             self.hide_timeout_id = GLib.timeout_add(3000, self._auto_hide)
 
     def _auto_hide(self):
         self.hide_timeout_id = None
-        if self.current_state == "idle":
+        if self.current_state in AUTO_HIDE_STATES:
             self.hide()
         return False
 
