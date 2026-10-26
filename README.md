@@ -144,7 +144,7 @@ Copy `.env.example` to `.env` and edit as needed:
 | `IDLE_TIMEOUT` | `600` | Seconds idle before the daemon exits and unloads the model (0 = never) |
 | `MAX_RECORDING_SECONDS` | `120` | Auto-stop a recording after this long (0 = no limit) |
 | `TRAILING_SPEECH_DELAY` | `0.5` | Seconds to keep recording after the stop press (apple-streaming caps it at 0.3) |
-| `VOCABULARY_HINTS` | `Claude,Anthropic` | apple-streaming: comma-separated words to bias recognition toward |
+| `VOCABULARY_HINTS` | `Claude,Anthropic` | Comma-separated words to bias recognition toward (apple-streaming and whisper; Parakeet has no hint support, use `replacements.json`) |
 
 ## Architecture
 

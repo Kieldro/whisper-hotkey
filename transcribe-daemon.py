@@ -73,9 +73,8 @@ VAD_THRESHOLD = _env_number("VAD_THRESHOLD", 0.5, float)
 ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
 ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
-# Comma-separated proper nouns / jargon the recognizer should expect.
-# Apple's SFSpeechRecognitionRequest.contextualStrings accepts these
-# as hints and reliably biases recognition toward them.
+# Comma-separated proper nouns / jargon the recognizer should expect: Apple's
+# contextualStrings and faster-whisper's hotwords. Parakeet has no equivalent.
 VOCABULARY_HINTS = [s.strip() for s in os.getenv("VOCABULARY_HINTS", "Claude,Anthropic").split(",") if s.strip()]
 PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
@@ -1381,6 +1380,7 @@ class TranscriptionPipeline:
                     audio_path,
                     beam_size=5,
                     vad_filter=False,  # Disabled - process entire audio without cutting
+                    hotwords=", ".join(VOCABULARY_HINTS) or None,
                 )
                 raw_text = " ".join([seg.text.strip() for seg in segments])
                 logger.info(f"Transcription complete ({len(raw_text)} chars)")
