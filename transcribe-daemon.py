@@ -638,22 +638,34 @@ logger.info(f"Paste chain: {PASTE_CHAIN}")
 
 
 def _copy_to_clipboard(text: str) -> None:
-    """Copy text to clipboard (helper for clipboard-based paste methods)."""
+    """Copy text to the system clipboard."""
+    if IS_MACOS:
+        # In-process write takes ~1ms; spawning pbcopy took ~50ms.
+        try:
+            from AppKit import NSPasteboard, NSPasteboardTypeString
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            if pb.setString_forType_(text, NSPasteboardTypeString):
+                return
+            logger.warning("NSPasteboard write failed, falling back to pbcopy")
+        except ImportError:
+            pass
+        cmd = ["pbcopy"]
+    elif SESSION_TYPE == "wayland":
+        cmd = ["wl-copy"]
+    else:
+        cmd = ["xclip", "-selection", "clipboard"]
     try:
-        if IS_MACOS:
-            subprocess.run(["pbcopy"], input=text.encode(), timeout=2, check=False)
-        elif SESSION_TYPE == "wayland":
-            subprocess.run(["wl-copy"], input=text.encode(), timeout=2, check=False)
-        else:
-            subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), timeout=2, check=False)
+        subprocess.run(cmd, input=text.encode(), timeout=2, check=False)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         logger.debug(f"Clipboard copy failed: {e}")
 
 
 def _execute_paste(method: str, text: str) -> bool:
-    """Execute a single paste method. Returns True on success."""
+    """Execute a single paste method. Returns True on success.
+
+    Clipboard-based methods expect `text` already on the clipboard."""
     if method == "macos-cgevent":
-        _copy_to_clipboard(text)
         try:
             from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
                                 CGEventPost, kCGEventFlagMaskCommand, kCGHIDEventTap)
@@ -684,7 +696,6 @@ def _execute_paste(method: str, text: str) -> bool:
         return result.returncode == 0
 
     elif method == "ydotool-clipboard":
-        _copy_to_clipboard(text)
         result = subprocess.run(
             ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
             timeout=5, capture_output=True, check=False,
@@ -699,7 +710,6 @@ def _execute_paste(method: str, text: str) -> bool:
         return result.returncode == 0
 
     elif method == "xdotool-clipboard":
-        _copy_to_clipboard(text)
         result = subprocess.run(
             ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
             timeout=5, capture_output=True, check=False,
@@ -712,7 +722,9 @@ def _execute_paste(method: str, text: str) -> bool:
 
 
 def paste_text(text: str) -> tuple:
-    """Paste text using fallback chain. Returns (success, method_used)."""
+    """Paste text using fallback chain. Returns (success, method_used).
+
+    Caller must copy `text` to the clipboard first."""
     if PASTE_METHOD != "auto":
         chain = [PASTE_METHOD]
     else:
