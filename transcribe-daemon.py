@@ -1044,7 +1044,7 @@ class AudioRecorderDaemon:
             msg = str(err)
             # 1110 = "No speech detected" — expected when there's a long
             # silence. Log at info so it's findable but not alarming.
-            logger.info(f"[sfs] handler err: {msg[:120]} — chaining")
+            logger.info(f"[sfs] handler err: {msg[:120]}")
             self._sfs_task_done = True
             self._start_next_sfs_segment()
             return
