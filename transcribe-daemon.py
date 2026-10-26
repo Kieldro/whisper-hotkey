@@ -82,12 +82,13 @@ def load_vocabulary() -> list:
     try:
         with open(VOCABULARY_FILE) as f:
             hints += [line.split("#", 1)[0] for line in f]
-        logger.info("Loaded vocabulary hints from %s", VOCABULARY_FILE)
     except FileNotFoundError:
         pass
     except OSError as e:
         logger.warning("Failed to read vocabulary file %s: %s", VOCABULARY_FILE, e)
-    return list(dict.fromkeys(h.strip() for h in hints if h.strip()))
+    hints = list(dict.fromkeys(h.strip() for h in hints if h.strip()))
+    logger.info("Loaded %d vocabulary hints", len(hints))
+    return hints
 
 
 # Proper nouns / jargon the recognizer should expect: Apple's contextualStrings
