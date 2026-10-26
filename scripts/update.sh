@@ -10,7 +10,7 @@ case "$OSTYPE" in
     *)       RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}" ;;
 esac
 STAMP="${RUNTIME_DIR%/}/whisper-hotkey-update-check"
-INTERVAL_MIN=$(( ${AUTO_UPDATE_INTERVAL:-3600} / 60 ))
+INTERVAL_MIN=$(( ${AUTO_UPDATE_INTERVAL:-86400} / 60 ))
 DAEMON_PID="${1:-}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] [update] $*"; }

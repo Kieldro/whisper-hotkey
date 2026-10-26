@@ -99,7 +99,7 @@ ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "tru
 RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"
 ENABLE_OVERLAY = os.getenv("ENABLE_OVERLAY", "true").lower() == "true"
 AUTO_UPDATE = os.getenv("AUTO_UPDATE", "true").lower() == "true"
-AUTO_UPDATE_INTERVAL = _env_number("AUTO_UPDATE_INTERVAL", 3600, int)
+AUTO_UPDATE_INTERVAL = _env_number("AUTO_UPDATE_INTERVAL", 86400, int)
 
 # Sound file paths (optional - will skip if not found)
 if IS_MACOS:
