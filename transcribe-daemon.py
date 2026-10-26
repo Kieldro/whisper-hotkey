@@ -73,9 +73,26 @@ VAD_THRESHOLD = _env_number("VAD_THRESHOLD", 0.5, float)
 ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
 ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
-# Comma-separated proper nouns / jargon the recognizer should expect: Apple's
-# contextualStrings and faster-whisper's hotwords. Parakeet has no equivalent.
-VOCABULARY_HINTS = [s.strip() for s in os.getenv("VOCABULARY_HINTS", "Claude,Anthropic").split(",") if s.strip()]
+VOCABULARY_FILE = os.getenv("VOCABULARY_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabulary.txt"))
+
+
+def load_vocabulary() -> list:
+    """VOCABULARY_HINTS (comma-separated) plus VOCABULARY_FILE (one term per line, # comments)."""
+    hints = os.getenv("VOCABULARY_HINTS", "Claude,Anthropic").split(",")
+    try:
+        with open(VOCABULARY_FILE) as f:
+            hints += [line.split("#", 1)[0] for line in f]
+        logger.info("Loaded vocabulary hints from %s", VOCABULARY_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("Failed to read vocabulary file %s: %s", VOCABULARY_FILE, e)
+    return list(dict.fromkeys(h.strip() for h in hints if h.strip()))
+
+
+# Proper nouns / jargon the recognizer should expect: Apple's contextualStrings
+# and faster-whisper's hotwords. Parakeet has no equivalent.
+VOCABULARY_HINTS = load_vocabulary()
 PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
 RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"

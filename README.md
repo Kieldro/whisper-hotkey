@@ -145,6 +145,7 @@ Copy `.env.example` to `.env` and edit as needed:
 | `MAX_RECORDING_SECONDS` | `120` | Auto-stop a recording after this long (0 = no limit) |
 | `TRAILING_SPEECH_DELAY` | `0.5` | Seconds to keep recording after the stop press (apple-streaming caps it at 0.3) |
 | `VOCABULARY_HINTS` | `Claude,Anthropic` | Comma-separated words to bias recognition toward (apple-streaming and whisper; Parakeet has no hint support, use `replacements.json`) |
+| `VOCABULARY_FILE` | `vocabulary.txt` | Extra hints, one per line (`#` comments), merged with `VOCABULARY_HINTS`. Git-ignored |
 
 ## Architecture
 
