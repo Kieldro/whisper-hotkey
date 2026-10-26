@@ -1751,8 +1751,9 @@ def main():
     logger.info(f"Acquired daemon lock, PID written to {daemon_lock_file}")
 
     # Launch status overlay — GTK on Linux, native AppKit on macOS.
-    # Use the same Python interpreter as the daemon (needed on macOS so the
-    # overlay picks up the venv's pyobjc; python3 on PATH won't have it).
+    # macOS needs the venv's pyobjc; Linux needs the system python3, since
+    # GTK bindings (python3-gi) are a distro package the venv can't see.
+    overlay_python = sys.executable if IS_MACOS else (shutil.which("python3") or sys.executable)
     overlay_script = None
     if ENABLE_OVERLAY:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1768,7 +1769,7 @@ def main():
             return None
         try:
             p = subprocess.Popen(
-                [sys.executable, overlay_script],
+                [overlay_python, overlay_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
