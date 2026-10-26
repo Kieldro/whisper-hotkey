@@ -100,11 +100,6 @@ NOTIFICATION_ID = 999999
 STATUS_FILE = os.path.join(RUNTIME_DIR, "whisper-hotkey-status.json")
 
 # Valid config values for validation
-VALID_WHISPER_MODELS = {
-    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
-    "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large",
-    "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
-}
 VALID_DEVICES = {"cpu", "cuda", "auto", "mps"}
 VALID_COMPUTE_TYPES = {
     "int8", "int8_float16", "int8_float32", "int16",
@@ -141,8 +136,16 @@ def validate_config() -> None:
         errors.append(f"ENGINE='{ENGINE}' invalid. Valid: {sorted(VALID_ENGINES)}")
 
     if ENGINE == "whisper":
-        if WHISPER_MODEL not in VALID_WHISPER_MODELS:
-            errors.append(f"WHISPER_MODEL='{WHISPER_MODEL}' not recognized. Valid: {sorted(VALID_WHISPER_MODELS)}")
+        # Ask faster-whisper itself so new names (large-v3-turbo, ...) pass;
+        # a "/" means an HF repo id or local model dir, which it also loads.
+        try:
+            from faster_whisper import available_models
+            known = set(available_models())
+        except ImportError:
+            known = None
+            errors.append("ENGINE=whisper but faster-whisper is not installed")
+        if known is not None and WHISPER_MODEL not in known and "/" not in WHISPER_MODEL:
+            errors.append(f"WHISPER_MODEL='{WHISPER_MODEL}' not recognized. Valid: {sorted(known)}")
 
         if DEVICE not in VALID_DEVICES:
             errors.append(f"DEVICE='{DEVICE}' invalid. Valid: {sorted(VALID_DEVICES)}")
