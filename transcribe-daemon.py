@@ -9,7 +9,6 @@ import sys
 import re
 import json
 import wave
-import struct
 import tempfile
 import subprocess
 import ctypes
@@ -52,26 +51,25 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-try:
-    IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))
-except ValueError:
-    print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
-    sys.exit(1)
+
+
+def _env_number(name: str, default, cast):
+    raw = os.getenv(name, str(default))
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"Error: {name}='{raw}' is not a valid {cast.__name__}", file=sys.stderr)
+        sys.exit(1)
+
+
+IDLE_TIMEOUT = _env_number("IDLE_TIMEOUT", 600, int)
 SAMPLE_RATE = 16000
-MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "120"))
-try:
-    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.5"))
-except ValueError:
-    print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
-    sys.exit(1)
+MAX_RECORDING_SECONDS = _env_number("MAX_RECORDING_SECONDS", 120, int)
+TRAILING_SPEECH_DELAY = _env_number("TRAILING_SPEECH_DELAY", 0.5, float)
 
 # Feature configs
 ENABLE_VAD = os.getenv("ENABLE_VAD", "true").lower() == "true"
-try:
-    VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
-except ValueError:
-    print(f"Error: VAD_THRESHOLD='{os.getenv('VAD_THRESHOLD')}' is not a valid number", file=sys.stderr)
-    sys.exit(1)
+VAD_THRESHOLD = _env_number("VAD_THRESHOLD", 0.5, float)
 ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
 ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
@@ -367,6 +365,7 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
 
     try:
         import torch
+        import numpy as np
     except ImportError:
         logger.warning("torch not installed, skipping VAD")
         return audio_path
@@ -382,8 +381,8 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
             n_frames = wf.getnframes()
             raw = wf.readframes(n_frames)
 
-        samples = struct.unpack(f"<{n_frames * n_channels}h", raw)
-        audio_tensor = torch.FloatTensor(samples) / 32768.0
+        samples = np.frombuffer(raw, dtype=np.int16)
+        audio_tensor = torch.from_numpy(samples.astype(np.float32) / 32768.0)
 
         speech_timestamps = get_speech_timestamps(
             audio_tensor,
@@ -403,7 +402,7 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
         start = max(0, speech_timestamps[0]["start"] - pad)
         end = min(len(samples), speech_timestamps[-1]["end"] + pad)
 
-        trimmed = struct.pack(f"<{end - start}h", *samples[start:end])
+        trimmed = samples[start:end].tobytes()
         with wave.open(audio_path, "wb") as wf:
             wf.setnchannels(n_channels)
             wf.setsampwidth(sampwidth)
@@ -442,44 +441,23 @@ def normalize_audio(audio_path: str) -> str:
             n_frames = wf.getnframes()
             raw = wf.readframes(n_frames)
 
-        n_samples = n_frames * n_channels
+        import numpy as np
+
         target = int(32767 * 0.8)
+        samples = np.frombuffer(raw, dtype=np.int16)
+        peak = int(np.max(np.abs(samples.astype(np.int32)))) if samples.size else 0
 
-        try:
-            import numpy as np
+        if peak == 0:
+            logger.info("Normalization: silent audio, skipping")
+            return audio_path
 
-            samples = np.frombuffer(raw, dtype=np.int16).copy()
-            peak = int(np.max(np.abs(samples)))
+        scale = target / peak
 
-            if peak == 0:
-                logger.info("Normalization: silent audio, skipping")
-                return audio_path
+        if 0.9 <= scale <= 1.1:
+            logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
+            return audio_path
 
-            scale = target / peak
-
-            if 0.9 <= scale <= 1.1:
-                logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
-                return audio_path
-
-            normalized = np.clip(samples * scale, -32768, 32767).astype(np.int16)
-            raw_out = normalized.tobytes()
-
-        except ImportError:
-            samples = list(struct.unpack(f"<{n_samples}h", raw))
-            peak = max(abs(s) for s in samples)
-
-            if peak == 0:
-                logger.info("Normalization: silent audio, skipping")
-                return audio_path
-
-            scale = target / peak
-
-            if 0.9 <= scale <= 1.1:
-                logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
-                return audio_path
-
-            normalized = [max(-32768, min(32767, int(s * scale))) for s in samples]
-            raw_out = struct.pack(f"<{n_samples}h", *normalized)
+        raw_out = np.clip(samples * scale, -32768, 32767).astype(np.int16).tobytes()
 
         with wave.open(audio_path, "wb") as wf:
             wf.setnchannels(n_channels)
@@ -1531,21 +1509,11 @@ class TranscriptionDaemon:
     def __init__(self):
         self.recorder = AudioRecorderDaemon()
         self.pipeline = TranscriptionPipeline()
-        self._audio_lock = threading.Lock()
-        self._current_audio_file: Optional[str] = None
         self.last_activity_time = time.time()
         self.idle_timeout = IDLE_TIMEOUT
 
-    def _process_audio(self) -> None:
+    def _process_audio(self, audio_file: str) -> None:
         """Process recorded audio: VAD -> normalize -> transcribe."""
-        # Grab the file path under lock
-        with self._audio_lock:
-            audio_file = self._current_audio_file
-            self._current_audio_file = None
-
-        if not audio_file:
-            return
-
         try:
             # VAD trimming — skip transcription if no speech
             audio_file = vad_trim_audio(audio_file)
@@ -1555,9 +1523,7 @@ class TranscriptionDaemon:
             # Audio normalization
             audio_file = normalize_audio(audio_file)
 
-            result = self.pipeline.process(audio_file)
-            if result:
-                print(result, flush=True)
+            self.pipeline.process(audio_file)
         finally:
             # Cleanup temp file
             if audio_file and os.path.exists(audio_file):
@@ -1603,13 +1569,12 @@ class TranscriptionDaemon:
 
         # Batch engines: result is a WAV path, empty means nothing to do.
         if not result:
+            self.recorder._cleanup_temp_files()  # e.g. an empty recording
             update_status("idle")
             return
-        with self._audio_lock:
-            self._current_audio_file = result
         logger.info("Processing audio synchronously...")
         try:
-            self._process_audio()
+            self._process_audio(result)
         except Exception as exc:
             logger.error(f"_process_audio crashed: {exc!r}", exc_info=True)
             update_status("idle")
