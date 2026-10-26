@@ -1633,9 +1633,19 @@ class SignalWaker:
 
     def drain(self) -> None:
         self._drain()
+        self._rearm()
+
+    def _rearm(self) -> None:
+        # CF read callbacks are one-shot. Draining the pipe ourselves can eat
+        # the byte CF already signaled for, and it then never calls on_readable
+        # (the only place that re-enabled it), so presses waited out the timeout.
+        if self._cf is not None:
+            CF, fdref = self._cf[0], self._cf[1]
+            CF.CFFileDescriptorEnableCallBacks(fdref, CF.kCFFileDescriptorReadCallBack)
 
     def wait(self, timeout: float) -> None:
         if self._cf is not None:
+            self._rearm()
             CF = self._cf[0]
             CF.CFRunLoopRunInMode(CF.kCFRunLoopDefaultMode, timeout, True)
         else:
