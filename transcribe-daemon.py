@@ -1676,6 +1676,17 @@ def main():
     state_file = os.path.join(RUNTIME_DIR, "whisper-hotkey-state")
     daemon_lock_file = os.path.join(RUNTIME_DIR, "whisper-hotkey-daemon.lock")
 
+    # Install handlers before the lock publishes our PID: the hotkey wrapper
+    # signals that PID directly, and an unhandled SIGUSR1/2 terminates us.
+    # Handlers only set flags; logging from a signal handler is unsafe.
+    start_recording_event = threading.Event()
+    stop_recording_event = threading.Event()
+    shutdown_event = threading.Event()
+    signal.signal(signal.SIGUSR2, lambda *_: start_recording_event.set())
+    signal.signal(signal.SIGUSR1, lambda *_: stop_recording_event.set())
+    signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
+    signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
+
     # Try to acquire the daemon lock
     lock_fd = acquire_daemon_lock(daemon_lock_file)
 
@@ -1749,58 +1760,36 @@ def main():
             logger.warning(f"Failed to start status overlay: {e}")
             return None
 
-    overlay_proc = spawn_overlay()
-
-    # Signal handlers - use threading.Event for thread-safe signaling
-    # NOTE: Signal handlers should only set flags, not call complex functions like logging
-    start_recording_event = threading.Event()
-    stop_recording_event = threading.Event()
-    shutdown_event = threading.Event()
-
-    def handle_start(signum, frame):
-        # UNSAFE to log here - just set the flag
-        start_recording_event.set()
-
-    def handle_stop(signum, frame):
-        # UNSAFE to log here - just set the flag
-        stop_recording_event.set()
-
-    def handle_shutdown(signum, frame):
-        # UNSAFE to log here - just set the flag
-        shutdown_event.set()
-
-    signal.signal(signal.SIGUSR2, handle_start)  # Start recording
-    signal.signal(signal.SIGUSR1, handle_stop)   # Stop recording
-    signal.signal(signal.SIGTERM, handle_shutdown)  # Shutdown daemon
-    signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
-    logger.info("Signal handlers registered")
-
-    # Start persistent daemon (slow: loads model)
-    # Create state file immediately so extra presses during load send STOP (not START)
-    Path(state_file).touch()
-
-    # apple-streaming has no model to load, so its chime would be a ~50ms blip.
-    stop_chime = start_looping_sound(SOUND_LOADING) if ENGINE != "apple-streaming" else (lambda: None)
-
-    send_notification(f"Loading {ENGINE} model…")
-    logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
-    daemon = TranscriptionDaemon()
-    daemon.last_activity_time = time.time()
-
-    stop_chime()
-
-    # Clear any signals the user sent while the model was loading (impatient extra presses)
-    start_recording_event.clear()
-    stop_recording_event.clear()
-    # Re-create state file in case a press during loading deleted it
-    Path(state_file).touch()
-
-    # Auto-start recording on first launch (the user pressed the hotkey to get here)
-    logger.info("Daemon ready, auto-starting first recording...")
-    daemon.start_recording()
-    daemon.last_activity_time = time.time()
-
+    overlay_proc = None
+    daemon = None
+    # Everything after the lock sits inside try/finally so a model-load
+    # failure still kills the overlay and releases the lock and state file.
     try:
+        overlay_proc = spawn_overlay()
+
+        # Create state file immediately so extra presses during load send STOP (not START)
+        Path(state_file).touch()
+
+        # apple-streaming has no model to load, so its chime would be a ~50ms blip.
+        stop_chime = start_looping_sound(SOUND_LOADING) if ENGINE != "apple-streaming" else (lambda: None)
+        send_notification(f"Loading {ENGINE} model…")
+        logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
+        try:
+            daemon = TranscriptionDaemon()
+        finally:
+            stop_chime()
+
+        # Clear any signals the user sent while the model was loading (impatient extra presses)
+        start_recording_event.clear()
+        stop_recording_event.clear()
+        # Re-create state file in case a press during loading deleted it
+        Path(state_file).touch()
+
+        # Auto-start recording on first launch (the user pressed the hotkey to get here)
+        logger.info("Daemon ready, auto-starting first recording...")
+        daemon.start_recording()
+        daemon.last_activity_time = time.time()
+
         logger.info("Daemon loop started, model loaded and ready")
 
         while not shutdown_event.is_set():
@@ -1859,12 +1848,14 @@ def main():
 
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
+        send_notification(f"❌ Daemon crashed: {str(e)[:60]}")
     finally:
         logger.info("Cleaning up...")
         if overlay_proc and overlay_proc.poll() is None:
             overlay_proc.terminate()
             logger.info("Terminated status overlay")
-        daemon.cleanup()
+        if daemon is not None:
+            daemon.cleanup()
         cleanup_status()
         try:
             if os.path.exists(state_file):
@@ -1872,20 +1863,19 @@ def main():
                 logger.info("Removed state file")
         except OSError:
             pass
-        # Release the lock by closing the file descriptor
+        # Unlink while still holding the lock: unlinking after close lets a
+        # starting daemon lock the old inode and then lose its lock file.
+        try:
+            os.unlink(daemon_lock_file)
+            logger.info("Removed daemon lock file")
+        except OSError:
+            pass
         if lock_fd is not None:
             try:
                 os.close(lock_fd)
                 logger.info("Released daemon lock")
             except OSError:
                 pass
-        # Remove lock file
-        try:
-            if os.path.exists(daemon_lock_file):
-                os.unlink(daemon_lock_file)
-                logger.info("Removed daemon lock file")
-        except OSError:
-            pass
         logger.info("=== Daemon exiting ===")
 
 
