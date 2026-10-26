@@ -3,8 +3,14 @@ restart detection. Reproduces the duplicate-words bug observed in
 production logs (2026-05-11 16:21:24 session).
 """
 import importlib.util
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+# Keep the module's log/status files away from a live daemon's: the handler
+# writes the status file, which would pop the live overlay.
+os.environ["TMPDIR"] = tempfile.mkdtemp(prefix="whisper-hotkey-test-") + "/"
 
 
 def _load_daemon_module():
@@ -37,6 +43,12 @@ class FakeResult:
         return self._final
 
 
+def _new_recorder(mod):
+    rec = mod.AudioRecorderDaemon()
+    rec._sfs_recognizer = None  # _start_next_sfs_segment will early-return
+    return rec
+
+
 def feed(rec, events):
     for text, is_final in events:
         rec._sfs_handle(FakeResult(text, is_final), None)
@@ -58,12 +70,7 @@ def test_refinement_not_promoted_to_segments():
     misinterpreted as fresh utterances.
     """
     mod = _load_daemon_module()
-    rec = mod.AudioRecorderDaemon.__new__(mod.AudioRecorderDaemon)
-    rec._sfs_segments = []
-    rec._sfs_current_partial = ""
-    rec._sfs_stopped = False
-    rec._sfs_recognizer = None  # _start_next_sfs_segment will early-return
-    rec.live_text = ""
+    rec = _new_recorder(mod)
 
     events = [
         ("Have", False),
@@ -89,12 +96,7 @@ def test_real_utterance_restart_still_caught():
     new utterance. We must promote the prior partial so it isn't lost.
     """
     mod = _load_daemon_module()
-    rec = mod.AudioRecorderDaemon.__new__(mod.AudioRecorderDaemon)
-    rec._sfs_segments = []
-    rec._sfs_current_partial = ""
-    rec._sfs_stopped = False
-    rec._sfs_recognizer = None
-    rec.live_text = ""
+    rec = _new_recorder(mod)
 
     events = [
         ("The first phrase goes here now", False),
@@ -111,12 +113,7 @@ def test_real_utterance_restart_still_caught():
 def test_unrelated_silent_restart_caught():
     """Head changes AND words are mostly disjoint: still treat as restart."""
     mod = _load_daemon_module()
-    rec = mod.AudioRecorderDaemon.__new__(mod.AudioRecorderDaemon)
-    rec._sfs_segments = []
-    rec._sfs_current_partial = ""
-    rec._sfs_stopped = False
-    rec._sfs_recognizer = None
-    rec.live_text = ""
+    rec = _new_recorder(mod)
 
     events = [
         ("The quick brown fox jumps", False),
