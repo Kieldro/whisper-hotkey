@@ -568,11 +568,13 @@ def load_replacements() -> list:
 
     result = []
     for word, replacement in data.items():
-        try:
-            compiled = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
-            result.append((compiled, replacement))
-        except re.error as e:
-            logger.warning("Invalid replacement pattern %r: %s", word, e)
+        if not isinstance(replacement, str):
+            logger.warning("Replacement for %r must be a string, got %r; skipping", word, replacement)
+            continue
+        # Lookarounds instead of \b so words that start or end with
+        # punctuation ("C++", ".NET") still match.
+        compiled = re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.IGNORECASE)
+        result.append((compiled, replacement))
 
     if result:
         logger.info(f"Loaded {len(result)} word replacements from {REPLACEMENTS_FILE}")
@@ -585,7 +587,8 @@ _WORD_REPLACEMENTS = load_replacements()
 def apply_word_replacements(text: str) -> str:
     """Apply user-defined word replacements from replacements.json."""
     for pattern, replacement in _WORD_REPLACEMENTS:
-        text = pattern.sub(replacement, text)
+        # Callable so backslashes in the replacement are literal, not group refs.
+        text = pattern.sub(lambda _m, r=replacement: r, text)
     return text
 
 
