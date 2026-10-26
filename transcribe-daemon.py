@@ -1573,6 +1573,11 @@ class TranscriptionDaemon:
         """Stop recording and process."""
         logger.info("stop_and_process called")
         self.last_activity_time = time.time()  # Update activity time
+        if not self.recorder.is_recording:
+            # Stale state file (e.g. a failed start); nothing to transcribe.
+            logger.warning("Stop requested while not recording; ignoring")
+            update_status("idle")
+            return
         try:
             result = self.recorder.stop_recording()
         except Exception as exc:
@@ -1832,10 +1837,19 @@ def main():
         # Re-create state file in case a press during loading deleted it
         Path(state_file).touch()
 
+        def start_recording():
+            # A failed start must clear the state file, or the next press
+            # would send STOP to an idle daemon instead of retrying.
+            if not daemon.start_recording() and not daemon.recorder.is_recording:
+                try:
+                    os.unlink(state_file)
+                except OSError:
+                    pass
+            daemon.last_activity_time = time.time()
+
         # Auto-start recording on first launch (the user pressed the hotkey to get here)
         logger.info("Daemon ready, auto-starting first recording...")
-        daemon.start_recording()
-        daemon.last_activity_time = time.time()
+        start_recording()
 
         logger.info("Daemon loop started, model loaded and ready")
 
@@ -1843,8 +1857,7 @@ def main():
             while toggles and not shutdown_event.is_set():
                 if toggles.popleft() == signal.SIGUSR2:
                     logger.info("Received start recording signal")
-                    daemon.start_recording()
-                    daemon.last_activity_time = time.time()
+                    start_recording()
                 else:
                     logger.info("Received stop recording signal")
                     daemon.stop_and_process()
@@ -1869,7 +1882,7 @@ def main():
                 overlay_proc = spawn_overlay()
 
             # Check for idle timeout
-            if daemon.is_idle_timeout_exceeded():
+            if not daemon.recorder.is_recording and daemon.is_idle_timeout_exceeded():
                 logger.info(f"Idle timeout exceeded ({daemon.idle_timeout}s), shutting down daemon")
                 break
 
