@@ -6,8 +6,10 @@ Recognition already granted to the terminal; skips otherwise.
 
     venv/bin/python test_sfs_live.py
 """
+import atexit
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,7 @@ from pathlib import Path
 
 # Keep the module's log/status files away from a live daemon's.
 _RT = tempfile.mkdtemp(prefix="whisper-hotkey-test-")
+atexit.register(shutil.rmtree, _RT, ignore_errors=True)
 os.environ["TMPDIR"] = _RT + "/"
 
 DAEMON = os.getenv("DAEMON_PATH", str(Path(__file__).parent / "transcribe-daemon.py"))
