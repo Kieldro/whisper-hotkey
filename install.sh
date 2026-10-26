@@ -40,9 +40,10 @@ echo ""
 # --- Install system dependencies ---
 echo "Installing system dependencies..."
 
-COMMON_DEPS_APT="python3-venv python3-pip pulseaudio-utils libnotify-bin"
-COMMON_DEPS_PACMAN="python python-pip portaudio libnotify"
-COMMON_DEPS_DNF="python3-virtualenv portaudio-devel libnotify"
+# python3-gi/GTK: the status overlay runs on the system python3, not the venv
+COMMON_DEPS_APT="python3-venv python3-pip pulseaudio-utils libnotify-bin python3-gi gir1.2-gtk-3.0"
+COMMON_DEPS_PACMAN="python python-pip portaudio libnotify python-gobject gtk3"
+COMMON_DEPS_DNF="python3-virtualenv portaudio-devel libnotify python3-gobject gtk3"
 
 if [ "$SESSION" = "wayland" ]; then
     SESSION_DEPS_APT="wl-clipboard ydotool"
@@ -106,6 +107,9 @@ echo ""
 echo "Choose transcription engine:"
 echo "  1) Parakeet TDT (recommended - faster, better punctuation)"
 echo "  2) faster-whisper (traditional, configurable model sizes)"
+if [ "$OS_TYPE" = "Darwin" ]; then
+    echo "  3) Apple on-device streaming (live transcript, no model download)"
+fi
 read -p "Choice [1]: " ENGINE_CHOICE
 ENGINE_CHOICE="${ENGINE_CHOICE:-1}"
 
@@ -113,22 +117,22 @@ if [ "$ENGINE_CHOICE" = "2" ]; then
     ENGINE="whisper"
     echo "Installing faster-whisper..."
     pip install -q -r "$PROJECT_DIR/requirements.txt"
+elif [ "$ENGINE_CHOICE" = "3" ] && [ "$OS_TYPE" = "Darwin" ]; then
+    ENGINE="apple-streaming"
+    echo "Installing Apple streaming dependencies..."
+    pip install -q openai python-dotenv
 else
     ENGINE="parakeet"
     echo "Installing Parakeet TDT..."
     pip install -q "onnx-asr[hub]" "onnxruntime!=1.21" openai python-dotenv "silero-vad>=5.1"
 fi
 
-# macOS audio recording deps (sounddevice bundles PortAudio, no brew dep needed)
-# pyobjc-framework-Quartz enables the fast CGEvent paste path and shift-to-submit
-# detection (fallback is osascript, which works but is slower and silently
-# disables shift-to-submit).
+# macOS pyobjc bridges: AVFoundation records audio, Quartz drives the CGEvent
+# paste and shift-to-submit (osascript fallback is slower and has no
+# shift-to-submit), Speech powers ENGINE=apple-streaming.
 if [ "$OS_TYPE" = "Darwin" ]; then
     echo "Installing macOS audio and paste dependencies..."
-    # numpy is pulled in by silero-vad / onnx-asr already, but listed here
-    # for manual-install clarity. AVAudioRecorder replaces sounddevice on
-    # macOS (PortAudio's stop/abort can hang indefinitely on CoreAudio).
-    pip install -q numpy pyobjc-framework-Quartz pyobjc-framework-AVFoundation
+    pip install -q numpy pyobjc-framework-Quartz pyobjc-framework-AVFoundation pyobjc-framework-Speech
 fi
 
 echo ""
@@ -147,16 +151,8 @@ else
 fi
 
 # --- GPU detection ---
-if [ "$OS_TYPE" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && [ "$ENGINE" = "whisper" ]; then
-    echo ""
-    read -p "Apple Silicon detected. Enable MPS acceleration? [Y/n]: " USE_MPS
-    USE_MPS="${USE_MPS:-Y}"
-    if [[ "$USE_MPS" =~ ^[Yy] ]]; then
-        sed -i '' "s/^DEVICE=.*/DEVICE=mps/" "$PROJECT_DIR/.env"
-        sed -i '' "s/^COMPUTE_TYPE=.*/COMPUTE_TYPE=float16/" "$PROJECT_DIR/.env"
-        echo "MPS enabled"
-    fi
-elif command -v nvidia-smi &>/dev/null; then
+# (faster-whisper's ctranslate2 has no Apple GPU backend; macOS stays on CPU.)
+if command -v nvidia-smi &>/dev/null; then
     echo ""
     read -p "NVIDIA GPU detected. Enable CUDA acceleration? [Y/n]: " USE_CUDA
     USE_CUDA="${USE_CUDA:-Y}"
@@ -177,8 +173,10 @@ echo ""
 echo "Downloading model (this may take a minute)..."
 if [ "$ENGINE" = "parakeet" ]; then
     "$VENV_DIR/bin/python" -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v3'); print('Model downloaded')"
-else
+elif [ "$ENGINE" = "whisper" ]; then
     "$VENV_DIR/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small'); print('Model downloaded')"
+else
+    echo "No model needed; macOS asks for Speech Recognition permission on first use"
 fi
 
 echo ""
@@ -188,4 +186,8 @@ echo ""
 echo "Usage: Press your hotkey, speak, press again. Text appears where your cursor is."
 echo ""
 echo "Config: $PROJECT_DIR/.env"
-echo "Logs:   \${XDG_RUNTIME_DIR:-/tmp}/whisper-hotkey.log"
+if [ "$OS_TYPE" = "Darwin" ]; then
+    echo "Logs:   \$TMPDIR/whisper-hotkey.log"
+else
+    echo "Logs:   \${XDG_RUNTIME_DIR:-/tmp}/whisper-hotkey.log"
+fi
