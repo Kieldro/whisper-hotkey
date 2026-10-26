@@ -44,6 +44,8 @@ if [ "$OS_TYPE" = "Darwin" ]; then
     if grep -Fq "$WRAPPER_SCRIPT" "$SKHD_CONFIG" 2>/dev/null; then
         echo "⚠️  Hotkey already exists in $SKHD_CONFIG"
     else
+        # Without a trailing newline the binding would be glued onto the last line.
+        [ -s "$SKHD_CONFIG" ] && [ -n "$(tail -c1 "$SKHD_CONFIG")" ] && echo >> "$SKHD_CONFIG"
         echo "$BINDING" >> "$SKHD_CONFIG"
         echo "✅ Added binding to $SKHD_CONFIG"
     fi
@@ -63,9 +65,9 @@ fi
 detect_de() {
     if [ -n "$SWAYSOCK" ]; then
         echo "sway"
-    elif [ "$XDG_CURRENT_DESKTOP" = "KDE" ]; then
+    elif [[ "$XDG_CURRENT_DESKTOP" == *KDE* ]]; then
         echo "kde"
-    elif [ "$XDG_CURRENT_DESKTOP" = "GNOME" ]; then
+    elif [[ "$XDG_CURRENT_DESKTOP" == *GNOME* ]]; then  # Ubuntu: "ubuntu:GNOME"
         echo "gnome"
     elif pgrep -x "i3" > /dev/null; then
         echo "i3"

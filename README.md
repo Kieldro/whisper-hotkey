@@ -2,7 +2,7 @@
 
 Push-to-talk voice transcription for macOS and Linux. Press a hotkey, speak, press again — your words appear instantly as text wherever your cursor is.
 
-Runs 100% locally with [faster-whisper](https://github.com/guillaumekln/faster-whisper) or [Parakeet TDT v3](https://github.com/NVIDIA/NeMo). No cloud, no subscription, no data leaves your machine.
+Runs 100% locally with [faster-whisper](https://github.com/guillaumekln/faster-whisper), [Parakeet TDT v3](https://github.com/NVIDIA/NeMo), or (macOS) Apple's on-device speech recognizer. No cloud, no subscription, no data leaves your machine.
 
 ## How It Works
 
@@ -16,6 +16,7 @@ The model stays loaded in memory so subsequent uses are instant.
 ## Features
 
 - **Fast local transcription** — faster-whisper (~0.5s GPU, ~0.9s CPU) or Parakeet TDT (~0.3s)
+- **Live transcript (macOS)** — `ENGINE=apple-streaming` shows words in the overlay as you speak
 - **Auto-paste** — text appears wherever your cursor is
 - **Push-to-talk daemon** — background process with audio feedback (start chime, wind chime during model load, completion sound)
 - **Shift-to-submit** — hold Shift when pressing stop to press Enter after paste (great for chat apps)
@@ -41,23 +42,22 @@ The installer auto-detects your OS and handles dependencies, Python environment,
 
 **What the installer does:**
 - Installs [skhd](https://github.com/koekeishiya/skhd) via Homebrew
-- Installs Python deps: sounddevice, soundfile, numpy, **pyobjc-framework-Quartz**, and your chosen engine (parakeet or faster-whisper)
+- Installs Python deps: numpy, **pyobjc-framework-Quartz**, pyobjc-framework-AVFoundation, pyobjc-framework-Speech, and your chosen engine (parakeet, faster-whisper, or apple-streaming)
 - Configures Option+Space hotkey in `~/.config/skhd/skhdrc`
-- Starts the skhd launchd service (`brew services start skhd`)
-- Offers MPS acceleration on Apple Silicon (faster-whisper only)
+- Starts the skhd launchd service (`skhd --start-service`)
 
 **After install — grant Accessibility permission:**
 System Settings > Privacy & Security > Accessibility > add skhd
 
-**Recommended engine (Apple Silicon): Parakeet TDT 0.6b-v3** — ~0.3s transcription, built-in punctuation, 25 European languages, beats any faster-whisper size on this hardware. This is the installer default and what `ENGINE=parakeet` selects.
+**Recommended engine (Apple Silicon): Parakeet TDT 0.6b-v3** — ~0.3s transcription, built-in punctuation, 25 European languages, beats any faster-whisper size on this hardware. This is the installer default and what `ENGINE=parakeet` selects. `ENGINE=apple-streaming` needs no model download and streams a live transcript; grant Speech Recognition on first use.
 
 **Intel Mac:** Parakeet runs but is very slow. Use `ENGINE=whisper` with `WHISPER_MODEL=small`.
 
 **Performance:**
 - First press: ~2.5s startup (model loads once, stays resident)
-- Subsequent presses: near-instant (audio stream stays open, model in memory)
+- Subsequent presses: near-instant (model stays in memory)
 
-**GPU (Apple Silicon):** Parakeet runs on CPU via onnxruntime and is already fast enough. For `ENGINE=whisper`, set `DEVICE=mps` and `COMPUTE_TYPE=float16` in `.env`.
+**GPU (Apple Silicon):** Parakeet runs on CPU via onnxruntime and is already fast enough. faster-whisper (CTranslate2) has no Apple GPU backend, so `ENGINE=whisper` runs on CPU.
 
 **Paste mechanism:** `pyobjc-framework-Quartz` provides the fast CGEvent Cmd+V path (~5ms) and shift-to-submit detection. If Quartz is missing the daemon falls back to `osascript` (~100–300ms) and silently disables shift-to-submit — so install it.
 
@@ -68,7 +68,7 @@ System Settings > Privacy & Security > Accessibility > add skhd
 **Requirements:** Python 3.8+, PulseAudio
 
 **What the installer does:**
-- Installs system deps via apt/pacman/dnf (pulseaudio-utils, xclip/wl-clipboard, xdotool/ydotool, libnotify-bin)
+- Installs system deps via apt/pacman/dnf (pulseaudio-utils, xclip/wl-clipboard, xdotool/ydotool, libnotify-bin, python3-gi for the overlay)
 - Sets up hotkey binding for your desktop environment (i3, sway, GNOME, KDE)
 
 **Default engine:** Parakeet TDT (`nemo-parakeet-tdt-0.6b-v3`) — ~0.3s transcription, 25 languages.
@@ -97,11 +97,11 @@ pip install --force-reinstall ctranslate2==4.4.0
 ```bash
 # Ubuntu/Debian (X11)
 sudo apt install python3-venv python3-pip pulseaudio-utils \
-  xclip xdotool libnotify-bin
+  xclip xdotool libnotify-bin python3-gi gir1.2-gtk-3.0
 
 # Ubuntu/Debian (Wayland)
 sudo apt install python3-venv python3-pip pulseaudio-utils \
-  wl-clipboard ydotool libnotify-bin
+  wl-clipboard ydotool libnotify-bin python3-gi gir1.2-gtk-3.0
 # sudo systemctl enable --now ydotool
 ```
 
@@ -134,25 +134,28 @@ Copy `.env.example` to `.env` and edit as needed:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ENGINE` | `parakeet` | `parakeet` (recommended on Apple Silicon / Linux) or `whisper` |
+| `ENGINE` | `parakeet` | `parakeet` (recommended on Apple Silicon / Linux), `whisper`, or `apple-streaming` (macOS, live transcript) |
 | `WHISPER_MODEL` | `small` | Only used when `ENGINE=whisper`: `tiny`, `base`, `small`, `medium`, `large-v3` |
-| `DEVICE` | `cpu` | `cpu`, `cuda` (NVIDIA), or `mps` (Apple Silicon, whisper only) |
-| `COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (GPU/MPS) |
+| `DEVICE` | `cpu` | `cpu` or `cuda` (NVIDIA; whisper only) |
+| `COMPUTE_TYPE` | `int8` | `int8` (CPU), `float16` (GPU) |
 | `AUTO_PASTE` | `true` | Paste transcription into active window |
 | `ENABLE_POLISHING` | `false` | GPT grammar/formatting cleanup |
 | `OPENAI_API_KEY` | — | Required only if polishing is enabled |
-| `IDLE_TIMEOUT` | `0` | Seconds before daemon unloads model (0 = never) |
-| `TRAILING_SPEECH_DELAY` | `0.2` | Seconds to keep recording after hotkey release |
-| `STREAM_STOP_TIMEOUT` | `3.0` | Max seconds to wait for PortAudio stop before abandoning stream and restarting daemon |
+| `IDLE_TIMEOUT` | `600` | Seconds idle before the daemon exits and unloads the model (0 = never) |
+| `MAX_RECORDING_SECONDS` | `120` | Auto-stop a recording after this long (0 = no limit) |
+| `TRAILING_SPEECH_DELAY` | `0.5` | Seconds to keep recording after the stop press (apple-streaming caps it at 0.3) |
+| `VOCABULARY_HINTS` | `Claude,Anthropic` | Comma-separated words to bias recognition toward (apple-streaming and whisper; Parakeet has no hint support, use `replacements.json`) |
+| `VOCABULARY_FILE` | `vocabulary.txt` | Extra hints, one per line (`#` comments), merged with `VOCABULARY_HINTS`. Git-ignored |
 
 ## Architecture
 
 ```
 Hotkey press
-  -> records audio (sounddevice on macOS, parecord on Linux)
+  -> records audio (AVAudioRecorder on macOS, parecord on Linux)
+     or streams it to Apple's recognizer (ENGINE=apple-streaming)
   -> faster-whisper / Parakeet TDT transcribes locally
   -> (optional) GPT-4o mini polishes text
-  -> pastes into active window (pbcopy+osascript on macOS, xdotool/ydotool on Linux)
+  -> pastes into active window (CGEvent Cmd+V on macOS, xdotool/ydotool on Linux)
 ```
 
 The daemon (`transcribe-daemon.py`) loads the model once and stays resident (configurable via `IDLE_TIMEOUT`). First launch plays a wind chime while the model loads, then auto-starts recording.
@@ -169,7 +172,7 @@ The daemon (`transcribe-daemon.py`) loads the model once and stays resident (con
 
 **Model download fails** — models download on first run. Check your internet connection and try running the daemon manually to see errors.
 
-**Hotkey not working (macOS)** — verify skhd is running (`brew services list | grep skhd`). Restart with `brew services restart skhd`. Check the binding exists in `~/.config/skhd/skhdrc`.
+**Hotkey not working (macOS)** — verify skhd is running (`launchctl list | grep skhd`). Restart with `skhd --restart-service` (not `brew services`, which would start a second skhd that runs every hotkey twice). Check the binding exists in `~/.config/skhd/skhdrc`.
 
 ## License
 

@@ -9,13 +9,14 @@ import sys
 import re
 import json
 import wave
-import struct
 import tempfile
 import subprocess
 import ctypes
 import threading
 import signal
+import select
 import logging
+import collections
 import fcntl
 import shutil
 from pathlib import Path
@@ -50,29 +51,49 @@ COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-try:
-    IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "600"))
-except ValueError:
-    print(f"Error: IDLE_TIMEOUT='{os.getenv('IDLE_TIMEOUT')}' is not a valid integer", file=sys.stderr)
-    sys.exit(1)
+
+
+def _env_number(name: str, default, cast):
+    raw = os.getenv(name, str(default))
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"Error: {name}='{raw}' is not a valid {cast.__name__}", file=sys.stderr)
+        sys.exit(1)
+
+
+IDLE_TIMEOUT = _env_number("IDLE_TIMEOUT", 600, int)
 SAMPLE_RATE = 16000
-MAX_RECORDING_SECONDS = int(os.getenv("MAX_RECORDING_SECONDS", "120"))
-try:
-    TRAILING_SPEECH_DELAY = float(os.getenv("TRAILING_SPEECH_DELAY", "0.5"))
-except ValueError:
-    print(f"Error: TRAILING_SPEECH_DELAY='{os.getenv('TRAILING_SPEECH_DELAY')}' is not a valid number", file=sys.stderr)
-    sys.exit(1)
+MAX_RECORDING_SECONDS = _env_number("MAX_RECORDING_SECONDS", 120, int)
+TRAILING_SPEECH_DELAY = _env_number("TRAILING_SPEECH_DELAY", 0.5, float)
 
 # Feature configs
 ENABLE_VAD = os.getenv("ENABLE_VAD", "true").lower() == "true"
-try:
-    VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
-except ValueError:
-    print(f"Error: VAD_THRESHOLD='{os.getenv('VAD_THRESHOLD')}' is not a valid number", file=sys.stderr)
-    sys.exit(1)
+VAD_THRESHOLD = _env_number("VAD_THRESHOLD", 0.5, float)
 ENABLE_AUDIO_NORMALIZATION = os.getenv("ENABLE_AUDIO_NORMALIZATION", "true").lower() == "true"
 ENABLE_SPOKEN_PUNCTUATION = os.getenv("ENABLE_SPOKEN_PUNCTUATION", "false").lower() == "true"
 REPLACEMENTS_FILE = os.getenv("REPLACEMENTS_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "replacements.json"))
+VOCABULARY_FILE = os.getenv("VOCABULARY_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vocabulary.txt"))
+
+
+def load_vocabulary() -> list:
+    """VOCABULARY_HINTS (comma-separated) plus VOCABULARY_FILE (one term per line, # comments)."""
+    hints = os.getenv("VOCABULARY_HINTS", "Claude,Anthropic").split(",")
+    try:
+        with open(VOCABULARY_FILE) as f:
+            hints += [line.split("#", 1)[0] for line in f]
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("Failed to read vocabulary file %s: %s", VOCABULARY_FILE, e)
+    hints = list(dict.fromkeys(h.strip() for h in hints if h.strip()))
+    logger.info("Loaded %d vocabulary hints", len(hints))
+    return hints
+
+
+# Proper nouns / jargon the recognizer should expect: Apple's contextualStrings
+# and faster-whisper's hotwords. Parakeet has no equivalent.
+VOCABULARY_HINTS = load_vocabulary()
 PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
 SUBMIT_DELAY = float(os.getenv("SUBMIT_DELAY")) if os.getenv("SUBMIT_DELAY") else None  # seconds between paste and shift-to-submit Enter
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
@@ -97,11 +118,6 @@ NOTIFICATION_ID = 999999
 STATUS_FILE = os.path.join(RUNTIME_DIR, "whisper-hotkey-status.json")
 
 # Valid config values for validation
-VALID_WHISPER_MODELS = {
-    "tiny", "tiny.en", "base", "base.en", "small", "small.en",
-    "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large",
-    "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
-}
 VALID_DEVICES = {"cpu", "cuda", "auto", "mps"}
 VALID_COMPUTE_TYPES = {
     "int8", "int8_float16", "int8_float32", "int16",
@@ -120,6 +136,16 @@ def _sfs_norm_words(s: str) -> list:
     return _SFS_WORD_RE.findall(s.lower())
 
 
+def _pump_run_loop(seconds: float) -> None:
+    """Run the main CFRunLoop so SFSpeech callbacks are delivered."""
+    try:
+        import CoreFoundation as CF
+    except ImportError:
+        time.sleep(seconds)
+        return
+    CF.CFRunLoopRunInMode(CF.kCFRunLoopDefaultMode, seconds, False)
+
+
 def validate_config() -> None:
     """Validate all config values at startup. Exit with clear error on invalid values."""
     errors = []
@@ -128,8 +154,16 @@ def validate_config() -> None:
         errors.append(f"ENGINE='{ENGINE}' invalid. Valid: {sorted(VALID_ENGINES)}")
 
     if ENGINE == "whisper":
-        if WHISPER_MODEL not in VALID_WHISPER_MODELS:
-            errors.append(f"WHISPER_MODEL='{WHISPER_MODEL}' not recognized. Valid: {sorted(VALID_WHISPER_MODELS)}")
+        # Ask faster-whisper itself so new names (large-v3-turbo, ...) pass;
+        # a "/" means an HF repo id or local model dir, which it also loads.
+        try:
+            from faster_whisper import available_models
+            known = set(available_models())
+        except ImportError:
+            known = None
+            errors.append("ENGINE=whisper but faster-whisper is not installed")
+        if known is not None and WHISPER_MODEL not in known and "/" not in WHISPER_MODEL:
+            errors.append(f"WHISPER_MODEL='{WHISPER_MODEL}' not recognized. Valid: {sorted(known)}")
 
         if DEVICE not in VALID_DEVICES:
             errors.append(f"DEVICE='{DEVICE}' invalid. Valid: {sorted(VALID_DEVICES)}")
@@ -149,25 +183,28 @@ def validate_config() -> None:
     logger.info("Config validation passed")
 
 def send_notification(message: str) -> None:
-    """Send desktop notification that replaces previous ones."""
+    """Send desktop notification that replaces previous ones, without
+    blocking the caller on the notifier process."""
     if not ENABLE_NOTIFICATIONS:
         return
+    if IS_MACOS:
+        # Text goes in as an argument: interpolating it into the script broke
+        # on any quote in the transcript and let dictated text run AppleScript.
+        cmd = ['osascript',
+               '-e', 'on run argv',
+               '-e', 'display notification (item 1 of argv) with title "Voice Transcription"',
+               '-e', 'end run',
+               message]
+    else:
+        cmd = ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message]
     try:
-        if IS_MACOS:
-            safe = message.replace('\\', '\\\\').replace('"', '\\"')
-            subprocess.run(
-                ['osascript', '-e', f'display notification "{safe}" with title "Voice Transcription"'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        else:
-            subprocess.run(
-                ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         pass  # notify tool not installed
+
+
+def _preview(text: str, limit: int = 50) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def play_sound(sound_file: str) -> None:
@@ -179,6 +216,40 @@ def play_sound(sound_file: str) -> None:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         pass
+
+
+def start_looping_sound(sound_file: str):
+    """Replay sound_file until the returned stop() is called.
+
+    Stops only our own player: a blanket `pkill afplay` also cut off any
+    other audio the user had playing through afplay (e.g. TTS readouts).
+    """
+    if not sound_file or not os.path.exists(sound_file):
+        return lambda: None
+    player = 'afplay' if IS_MACOS else 'paplay'
+    stopped = threading.Event()
+    current: list = [None]
+
+    def loop():
+        while not stopped.is_set():
+            try:
+                proc = subprocess.Popen([player, sound_file],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                return
+            current[0] = proc
+            if stopped.is_set():  # stop() ran between the check and Popen
+                proc.terminate()
+            proc.wait()
+
+    threading.Thread(target=loop, daemon=True, name="looping-sound").start()
+
+    def stop():
+        stopped.set()
+        if current[0] is not None:
+            current[0].terminate()
+
+    return stop
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +304,16 @@ def _evdev_shift_held() -> bool:
     return False
 
 
+def _load_x11():
+    x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+    # Untyped, ctypes truncates the 64-bit Display* to a C int.
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    return x11
+
+
 def is_shift_held() -> bool:
     """Check if Shift is currently held.
 
@@ -254,7 +335,7 @@ def is_shift_held() -> bool:
         return _evdev_shift_held()
     else:
         try:
-            x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+            x11 = _load_x11()
             display = x11.XOpenDisplay(None)
             if not display:
                 return False
@@ -339,23 +420,19 @@ logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
 # ---------------------------------------------------------------------------
 
 _vad_model = None
-_vad_utils = None
 
 
 def _get_vad_model():
-    """Lazy-load Silero VAD model once, reuse on subsequent calls."""
-    global _vad_model, _vad_utils
+    """Lazy-load Silero VAD model once, reuse on subsequent calls.
+
+    From the pinned silero-vad package, which bundles the weights; torch.hub
+    fetched and executed the repo's GitHub master instead."""
+    global _vad_model
     if _vad_model is None:
-        import torch
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-        )
-        _vad_model = model
-        _vad_utils = utils
+        from silero_vad import load_silero_vad
+        _vad_model = load_silero_vad()
         logger.info("Silero VAD model loaded")
-    return _vad_model, _vad_utils
+    return _vad_model
 
 
 def vad_trim_audio(audio_path: str) -> Optional[str]:
@@ -365,13 +442,14 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
 
     try:
         import torch
+        import numpy as np
+        from silero_vad import get_speech_timestamps
     except ImportError:
-        logger.warning("torch not installed, skipping VAD")
+        logger.warning("silero-vad/torch not installed, skipping VAD")
         return audio_path
 
     try:
-        model, utils = _get_vad_model()
-        get_speech_timestamps = utils[0]
+        model = _get_vad_model()
 
         with wave.open(audio_path, "rb") as wf:
             n_channels = wf.getnchannels()
@@ -380,8 +458,8 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
             n_frames = wf.getnframes()
             raw = wf.readframes(n_frames)
 
-        samples = struct.unpack(f"<{n_frames * n_channels}h", raw)
-        audio_tensor = torch.FloatTensor(samples) / 32768.0
+        samples = np.frombuffer(raw, dtype=np.int16)
+        audio_tensor = torch.from_numpy(samples.astype(np.float32) / 32768.0)
 
         speech_timestamps = get_speech_timestamps(
             audio_tensor,
@@ -401,7 +479,7 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
         start = max(0, speech_timestamps[0]["start"] - pad)
         end = min(len(samples), speech_timestamps[-1]["end"] + pad)
 
-        trimmed = struct.pack(f"<{end - start}h", *samples[start:end])
+        trimmed = samples[start:end].tobytes()
         with wave.open(audio_path, "wb") as wf:
             wf.setnchannels(n_channels)
             wf.setsampwidth(sampwidth)
@@ -440,44 +518,23 @@ def normalize_audio(audio_path: str) -> str:
             n_frames = wf.getnframes()
             raw = wf.readframes(n_frames)
 
-        n_samples = n_frames * n_channels
+        import numpy as np
+
         target = int(32767 * 0.8)
+        samples = np.frombuffer(raw, dtype=np.int16)
+        peak = int(np.max(np.abs(samples.astype(np.int32)))) if samples.size else 0
 
-        try:
-            import numpy as np
+        if peak == 0:
+            logger.info("Normalization: silent audio, skipping")
+            return audio_path
 
-            samples = np.frombuffer(raw, dtype=np.int16).copy()
-            peak = int(np.max(np.abs(samples)))
+        scale = target / peak
 
-            if peak == 0:
-                logger.info("Normalization: silent audio, skipping")
-                return audio_path
+        if 0.9 <= scale <= 1.1:
+            logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
+            return audio_path
 
-            scale = target / peak
-
-            if 0.9 <= scale <= 1.1:
-                logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
-                return audio_path
-
-            normalized = np.clip(samples * scale, -32768, 32767).astype(np.int16)
-            raw_out = normalized.tobytes()
-
-        except ImportError:
-            samples = list(struct.unpack(f"<{n_samples}h", raw))
-            peak = max(abs(s) for s in samples)
-
-            if peak == 0:
-                logger.info("Normalization: silent audio, skipping")
-                return audio_path
-
-            scale = target / peak
-
-            if 0.9 <= scale <= 1.1:
-                logger.debug("Normalization: already near target (scale=%.3f), skipping", scale)
-                return audio_path
-
-            normalized = [max(-32768, min(32767, int(s * scale))) for s in samples]
-            raw_out = struct.pack(f"<{n_samples}h", *normalized)
+        raw_out = np.clip(samples * scale, -32768, 32767).astype(np.int16).tobytes()
 
         with wave.open(audio_path, "wb") as wf:
             wf.setnchannels(n_channels)
@@ -566,11 +623,13 @@ def load_replacements() -> list:
 
     result = []
     for word, replacement in data.items():
-        try:
-            compiled = re.compile(r"\b" + re.escape(word) + r"\b", re.IGNORECASE)
-            result.append((compiled, replacement))
-        except re.error as e:
-            logger.warning("Invalid replacement pattern %r: %s", word, e)
+        if not isinstance(replacement, str):
+            logger.warning("Replacement for %r must be a string, got %r; skipping", word, replacement)
+            continue
+        # Lookarounds instead of \b so words that start or end with
+        # punctuation ("C++", ".NET") still match.
+        compiled = re.compile(r"(?<!\w)" + re.escape(word) + r"(?!\w)", re.IGNORECASE)
+        result.append((compiled, replacement))
 
     if result:
         logger.info(f"Loaded {len(result)} word replacements from {REPLACEMENTS_FILE}")
@@ -583,7 +642,8 @@ _WORD_REPLACEMENTS = load_replacements()
 def apply_word_replacements(text: str) -> str:
     """Apply user-defined word replacements from replacements.json."""
     for pattern, replacement in _WORD_REPLACEMENTS:
-        text = pattern.sub(replacement, text)
+        # Callable so backslashes in the replacement are literal, not group refs.
+        text = pattern.sub(lambda _m, r=replacement: r, text)
     return text
 
 
@@ -666,11 +726,21 @@ def _log_x_exhaustion_hint(stderr: str) -> None:
 
 
 def _copy_to_clipboard(text: str, primary: bool = False) -> bool:
-    """Copy text to clipboard (helper for clipboard-based paste methods). Returns True on success.
+    """Copy text to the system clipboard. Returns True on success.
 
     primary=True targets the Wayland PRIMARY selection instead (what VTE pastes on Shift+Insert).
     """
     if IS_MACOS:
+        # In-process write takes ~1ms; spawning pbcopy took ~50ms.
+        try:
+            from AppKit import NSPasteboard, NSPasteboardTypeString
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            if pb.setString_forType_(text, NSPasteboardTypeString):
+                return True
+            logger.warning("NSPasteboard write failed, falling back to pbcopy")
+        except ImportError:
+            pass
         cmd = ["pbcopy"]
     elif SESSION_TYPE == "wayland":
         cmd = ["wl-copy", "--primary"] if primary else ["wl-copy"]
@@ -771,9 +841,10 @@ def wait_for_focus() -> None:
 
 
 def _execute_paste(method: str, text: str) -> bool:
-    """Execute a single paste method. Returns True on success."""
+    """Execute a single paste method. Returns True on success.
+
+    Clipboard-based methods expect `text` already on the clipboard."""
     if method == "macos-cgevent":
-        _copy_to_clipboard(text)
         try:
             from Quartz import (CGEventCreateKeyboardEvent, CGEventSetFlags,
                                 CGEventPost, kCGEventFlagMaskCommand, kCGHIDEventTap)
@@ -801,9 +872,8 @@ def _execute_paste(method: str, text: str) -> bool:
 
     elif method == "ydotool-clipboard":
         # Wayland gives no way to ask which app is focused, so use the one key that pastes
-        # everywhere: Shift+Insert. GTK/Chrome/Electron paste CLIPBOARD; VTE terminals
-        # (Ptyxis, gnome-terminal) paste PRIMARY, where Ctrl+V would just send ^V.
-        _copy_to_clipboard(text)
+        # everywhere: Shift+Insert. GTK/Chrome/Electron paste CLIPBOARD (set by the caller);
+        # VTE terminals (Ptyxis, gnome-terminal) paste PRIMARY, where Ctrl+V would just send ^V.
         _copy_to_clipboard(text, primary=True)
         wait_for_focus()
         return _run_paste_cmd(["ydotool", "key", "42:1", "110:1", "110:0", "42:0"])
@@ -812,7 +882,6 @@ def _execute_paste(method: str, text: str) -> bool:
         return _run_paste_cmd(["xdotool", "type", "--clearmodifiers", "--delay", "0", text])
 
     elif method == "xdotool-clipboard":
-        _copy_to_clipboard(text)
         return _run_paste_cmd(["xdotool", "key", "--clearmodifiers", "ctrl+v"])
 
     else:
@@ -821,7 +890,9 @@ def _execute_paste(method: str, text: str) -> bool:
 
 
 def paste_text(text: str) -> tuple:
-    """Paste text using fallback chain. Returns (success, method_used)."""
+    """Paste text using fallback chain. Returns (success, method_used).
+
+    Caller must copy `text` to the clipboard first."""
     if PASTE_METHOD != "auto":
         chain = [PASTE_METHOD]
     else:
@@ -864,11 +935,16 @@ class AudioRecorderDaemon:
         self._sfs_request = None
         self._sfs_task = None
         self._sfs_recognizer = None
+        self._sfs_handler = None
+        self._reset_sfs_state()
+
+    def _reset_sfs_state(self) -> None:
         self._sfs_stopped = False          # guard against late handler calls
+        self._sfs_ending = False           # endAudio sent; don't chain new tasks
+        self._sfs_task_done = False        # current task delivered its final/error
         self._sfs_segments: list = []      # finalized per-segment texts
         self._sfs_current_partial: str = ""
         self.live_text: str = ""
-        self._final_text: Optional[str] = None
 
     def start_recording(self) -> bool:
         """Start recording. Returns True on success."""
@@ -999,12 +1075,10 @@ class AudioRecorderDaemon:
         try:
             from Speech import (
                 SFSpeechRecognizer,
-                SFSpeechAudioBufferRecognitionRequest,
                 SFSpeechRecognizerAuthorizationStatusAuthorized,
                 SFSpeechRecognizerAuthorizationStatusNotDetermined,
                 SFSpeechRecognizerAuthorizationStatusDenied,
                 SFSpeechRecognizerAuthorizationStatusRestricted,
-                SFSpeechRecognitionTaskHintDictation,
             )
             from AVFoundation import AVAudioEngine
         except ImportError as exc:
@@ -1028,14 +1102,9 @@ class AudioRecorderDaemon:
                 done.set()
 
             SFSpeechRecognizer.requestAuthorization_(_auth_cb)
-            try:
-                from Foundation import NSRunLoop, NSDate
-                deadline = time.monotonic() + 15
-                while not done.is_set() and time.monotonic() < deadline:
-                    NSRunLoop.currentRunLoop().runUntilDate_(
-                        NSDate.dateWithTimeIntervalSinceNow_(0.1))
-            except ImportError:
-                done.wait(15)
+            deadline = time.monotonic() + 15
+            while not done.is_set() and time.monotonic() < deadline:
+                _pump_run_loop(0.1)
             status = got[0]
             if status != SFSpeechRecognizerAuthorizationStatusAuthorized:
                 logger.error(f"Speech Recognition not authorized after prompt (status={status})")
@@ -1057,12 +1126,7 @@ class AudioRecorderDaemon:
             send_notification("❌ Enable Dictation in System Settings → Keyboard")
             return False
 
-        # Reset streaming accumulators.
-        self._sfs_stopped = False
-        self._sfs_segments = []
-        self._sfs_current_partial = ""
-        self.live_text = ""
-        self._final_text = None
+        self._reset_sfs_state()
         self._sfs_recognizer = recog
 
         # SFSpeechRecognizer finalizes its task on extended silence
@@ -1083,18 +1147,7 @@ class AudioRecorderDaemon:
                 logger.error(f"[sfs] handler crashed: {exc!r}", exc_info=True)
 
         self._sfs_handler = handler
-
-        req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
-        req.setShouldReportPartialResults_(True)
-        # Hint dictation so Apple segments on natural pauses.
-        if hasattr(req, "setTaskHint_"):
-            req.setTaskHint_(SFSpeechRecognitionTaskHintDictation)
-        if hasattr(req, "setRequiresOnDeviceRecognition_"):
-            req.setRequiresOnDeviceRecognition_(True)
-        if hasattr(req, "setAddsPunctuation_"):
-            req.setAddsPunctuation_(True)
-        self._sfs_request = req
-        self._sfs_task = recog.recognitionTaskWithRequest_resultHandler_(req, handler)
+        self._new_sfs_task()
 
         engine = AVAudioEngine.alloc().init()
         inp = engine.inputNode()
@@ -1159,7 +1212,8 @@ class AudioRecorderDaemon:
             msg = str(err)
             # 1110 = "No speech detected" — expected when there's a long
             # silence. Log at info so it's findable but not alarming.
-            logger.info(f"[sfs] handler err: {msg[:120]} — chaining")
+            logger.info(f"[sfs] handler err: {msg[:120]}")
+            self._sfs_task_done = True
             self._start_next_sfs_segment()
             return
         if result is None:
@@ -1171,13 +1225,29 @@ class AudioRecorderDaemon:
 
         # --- 1. Detect utterance restart (Apple silently began a new
         #        utterance; previous partial must be promoted).
+        #
+        # Refinement guard: head_changed/shrank_a_lot also fire when
+        # Apple keeps refining the SAME utterance (e.g.
+        # "More smoke smoke test" → "Writing more smoke test"). Distinguish
+        # by word-set overlap — refinements share most words, true
+        # restarts share few. Without this guard each refinement gets
+        # promoted and the final transcript repeats the same idea N times.
         if prev and not is_final:
             shrank_a_lot = len(text) < max(3, len(prev) // 2)
             head_changed = len(prev) > 15 and text[:10].lower() != prev[:10].lower()
             if shrank_a_lot or head_changed:
-                logger.info(f"[sfs] utterance restart; promoting partial to segment: {prev!r}")
-                self._sfs_segments.append(prev)
-                prev = ""
+                prev_words = set(_sfs_norm_words(prev))
+                new_words_set = set(_sfs_norm_words(text))
+                smaller = min(len(prev_words), len(new_words_set))
+                overlap = len(prev_words & new_words_set) / smaller if smaller else 0.0
+                is_refinement = smaller >= 2 and overlap >= 0.5
+                if is_refinement:
+                    logger.info(f"[sfs] refinement (overlap={overlap:.2f}); dropping prev partial: {prev!r} → {text!r}")
+                    prev = ""
+                else:
+                    logger.info(f"[sfs] utterance restart; promoting partial to segment: {prev!r}")
+                    self._sfs_segments.append(prev)
+                    prev = ""
 
         # --- 2. Detect subsumption (new text contains leading segments)
         new_words = _sfs_norm_words(text)
@@ -1208,6 +1278,7 @@ class AudioRecorderDaemon:
             else:
                 logger.info("[sfs] empty final (no prev either); nothing promoted")
             self._sfs_current_partial = ""
+            self._sfs_task_done = True
             full = " ".join(self._sfs_segments).strip()
             self.live_text = full
             update_status("recording", live_text=full)
@@ -1223,27 +1294,28 @@ class AudioRecorderDaemon:
     def _start_next_sfs_segment(self) -> None:
         """Start a fresh SFSpeech request+task after the previous one
         finalized on silence, so recording continues seamlessly."""
-        if self._sfs_stopped or self._sfs_recognizer is None:
+        if self._sfs_stopped or self._sfs_ending or self._sfs_recognizer is None:
             return
-        try:
-            from Speech import (
-                SFSpeechAudioBufferRecognitionRequest,
-                SFSpeechRecognitionTaskHintDictation,
-            )
-        except ImportError:
-            return
+        self._new_sfs_task()
+        logger.info(f"[sfs] started new segment (segments so far: {len(self._sfs_segments)})")
+
+    def _new_sfs_task(self) -> None:
+        from Speech import SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionTaskHintDictation
         req = SFSpeechAudioBufferRecognitionRequest.alloc().init()
         req.setShouldReportPartialResults_(True)
+        # Hint dictation so Apple segments on natural pauses.
         if hasattr(req, "setTaskHint_"):
             req.setTaskHint_(SFSpeechRecognitionTaskHintDictation)
         if hasattr(req, "setRequiresOnDeviceRecognition_"):
             req.setRequiresOnDeviceRecognition_(True)
         if hasattr(req, "setAddsPunctuation_"):
             req.setAddsPunctuation_(True)
+        if VOCABULARY_HINTS and hasattr(req, "setContextualStrings_"):
+            req.setContextualStrings_(VOCABULARY_HINTS)
+        self._sfs_task_done = False
         self._sfs_request = req
         self._sfs_task = self._sfs_recognizer.recognitionTaskWithRequest_resultHandler_(
             req, self._sfs_handler)
-        logger.info(f"[sfs] started new segment (segments so far: {len(self._sfs_segments)})")
 
     def _stop_recording_apple_streaming(self) -> Optional[str]:
         """Finalize the streaming recognition and return the text.
@@ -1252,18 +1324,17 @@ class AudioRecorderDaemon:
         returns the transcript directly and stop_and_process knows to
         skip the pipeline.
 
-        Important ordering: DO NOT set _sfs_stopped before calling
-        endAudio and waiting for the isFinal callback. If we did, the
-        handler would early-return on the very final that contains the
-        last word the user said, and we'd paste the previous partial
-        (missing the last word). Only flip _sfs_stopped after we've
-        collected the final.
+        Important ordering: DO NOT set _sfs_stopped before endAudio's
+        final arrives, or the handler drops the final that carries the
+        last word and we paste the previous partial.
         """
         logger.info("Stopping recording (Apple streaming)...")
         self.is_recording = False
 
-        # Give the user a brief tail so the last word reaches the tap.
-        time.sleep(min(TRAILING_SPEECH_DELAY, 0.3))
+        # Give the user a brief tail so the last word reaches the tap. Pump
+        # rather than sleep so a silence-final in this window still chains
+        # and the tail audio lands in a live request.
+        _pump_run_loop(min(TRAILING_SPEECH_DELAY, 0.3))
 
         if self._av_engine is not None:
             try:
@@ -1273,38 +1344,20 @@ class AudioRecorderDaemon:
                 logger.warning(f"AVAudioEngine stop raised: {exc}")
             self._av_engine = None
 
-        last_req = self._sfs_request
-        if last_req is not None:
+        self._sfs_ending = True
+        if self._sfs_request is not None:
             try:
-                last_req.endAudio()
+                self._sfs_request.endAudio()
             except Exception as exc:
                 logger.warning(f"endAudio raised: {exc}")
 
-        # Wait for the handler to receive the final isFinal callback
-        # (which contains the last word Apple heard after endAudio
-        # processed the tail of the audio). The handler appends to
-        # segments when isFinal fires — watch for that, OR for the
-        # current_partial to grow, as a signal we got the final update.
-        try:
-            from Foundation import NSRunLoop, NSDate
-            initial_seg_n = len(self._sfs_segments)
-            initial_partial_len = len(self._sfs_current_partial)
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                NSRunLoop.currentRunLoop().runUntilDate_(
-                    NSDate.dateWithTimeIntervalSinceNow_(0.03))
-                grew_segments = len(self._sfs_segments) > initial_seg_n
-                grew_partial = len(self._sfs_current_partial) > initial_partial_len
-                if grew_segments or grew_partial:
-                    # Give a brief settle window for any follow-up final
-                    # that subsumes the grown partial.
-                    settle = time.monotonic() + 0.15
-                    while time.monotonic() < settle:
-                        NSRunLoop.currentRunLoop().runUntilDate_(
-                            NSDate.dateWithTimeIntervalSinceNow_(0.03))
-                    break
-        except ImportError:
-            pass
+        # isFinal (or an error) is the task's last callback, so stop waiting
+        # the moment it lands; the deadline covers a task that never reports.
+        t0 = time.monotonic()
+        while not self._sfs_task_done and time.monotonic() - t0 < 1.0:
+            _pump_run_loop(0.02)
+        if not self._sfs_task_done:
+            logger.warning("[sfs] no final within 1s of endAudio; using last partial")
 
         # NOW block any further late callbacks from writing status JSON.
         self._sfs_stopped = True
@@ -1497,6 +1550,7 @@ class TranscriptionPipeline:
                     audio_path,
                     beam_size=5,
                     vad_filter=False,  # Disabled - process entire audio without cutting
+                    hotwords=", ".join(VOCABULARY_HINTS) or None,
                 )
                 raw_text = " ".join([seg.text.strip() for seg in segments])
                 logger.info(f"Transcription complete ({len(raw_text)} chars)")
@@ -1616,7 +1670,7 @@ class TranscriptionPipeline:
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             play_sound(SOUND_PASTE)
-            send_notification(f"Pasted: {final_text[:50]}...")
+            send_notification(f"Pasted: {_preview(final_text)}")
 
             # Restore clipboard (only for direct-type methods that don't need clipboard)
             if saved_clipboard is not None and method_used in ("xdotool-type", "wtype"):
@@ -1625,7 +1679,7 @@ class TranscriptionPipeline:
         else:
             logger.info("Auto-paste disabled")
             play_sound(SOUND_PASTE)
-            send_notification(f"Copied: {final_text[:50]}...")
+            send_notification(f"Copied: {_preview(final_text)}")
 
         logger.info("Processing complete")
         update_status("idle", last_text=final_text[:100])
@@ -1638,21 +1692,11 @@ class TranscriptionDaemon:
     def __init__(self):
         self.recorder = AudioRecorderDaemon()
         self.pipeline = TranscriptionPipeline()
-        self._audio_lock = threading.Lock()
-        self._current_audio_file: Optional[str] = None
         self.last_activity_time = time.time()
         self.idle_timeout = IDLE_TIMEOUT
 
-    def _process_audio(self) -> None:
+    def _process_audio(self, audio_file: str) -> None:
         """Process recorded audio: VAD -> normalize -> transcribe."""
-        # Grab the file path under lock
-        with self._audio_lock:
-            audio_file = self._current_audio_file
-            self._current_audio_file = None
-
-        if not audio_file:
-            return
-
         try:
             # VAD trimming — skip transcription if no speech
             audio_file = vad_trim_audio(audio_file)
@@ -1662,9 +1706,7 @@ class TranscriptionDaemon:
             # Audio normalization
             audio_file = normalize_audio(audio_file)
 
-            result = self.pipeline.process(audio_file)
-            if result:
-                print(result, flush=True)
+            self.pipeline.process(audio_file)
         finally:
             # Cleanup temp file
             if audio_file and os.path.exists(audio_file):
@@ -1683,6 +1725,11 @@ class TranscriptionDaemon:
         start_shift_watch()
         start_focus_waiter()
         self.last_activity_time = time.time()  # Update activity time
+        if not self.recorder.is_recording:
+            # Stale state file (e.g. a failed start); nothing to transcribe.
+            logger.warning("Stop requested while not recording; ignoring")
+            update_status("idle")
+            return
         try:
             result = self.recorder.stop_recording()
         except Exception as exc:
@@ -1707,13 +1754,12 @@ class TranscriptionDaemon:
 
         # Batch engines: result is a WAV path, empty means nothing to do.
         if not result:
+            self.recorder._cleanup_temp_files()  # e.g. an empty recording
             update_status("idle")
             return
-        with self._audio_lock:
-            self._current_audio_file = result
         logger.info("Processing audio synchronously...")
         try:
-            self._process_audio()
+            self._process_audio(result)
         except Exception as exc:
             logger.error(f"_process_audio crashed: {exc!r}", exc_info=True)
             update_status("idle")
@@ -1729,6 +1775,68 @@ class TranscriptionDaemon:
     def cleanup(self) -> None:
         """Cleanup resources."""
         self.recorder.cleanup()
+
+
+class SignalWaker:
+    """Sleeps the main loop until a signal arrives or the timeout passes.
+
+    signal.set_wakeup_fd makes the C-level handler write each signal number to
+    a pipe; on macOS that pipe is a CFRunLoop source, so waiting also delivers
+    SFSpeech callbacks. `received` keeps those numbers in arrival order: Python
+    runs pending handlers by signal number, so after a long C call a
+    start+stop pair would otherwise replay as stop+start.
+    """
+
+    def __init__(self):
+        self.received = collections.deque()
+        self._r, w = os.pipe()
+        os.set_blocking(self._r, False)
+        os.set_blocking(w, False)
+        signal.set_wakeup_fd(w)
+        self._cf = None
+        if IS_MACOS:
+            try:
+                import CoreFoundation as CF
+            except ImportError:
+                return
+
+            def on_readable(fdref, _types, _info):
+                self._drain()
+                CF.CFFileDescriptorEnableCallBacks(fdref, CF.kCFFileDescriptorReadCallBack)
+
+            fdref = CF.CFFileDescriptorCreate(None, self._r, False, on_readable, None)
+            CF.CFFileDescriptorEnableCallBacks(fdref, CF.kCFFileDescriptorReadCallBack)
+            src = CF.CFFileDescriptorCreateRunLoopSource(None, fdref, 0)
+            CF.CFRunLoopAddSource(CF.CFRunLoopGetCurrent(), src, CF.kCFRunLoopDefaultMode)
+            self._cf = (CF, fdref, src, on_readable)  # CF holds no Python refs
+
+    def _drain(self) -> None:
+        try:
+            while data := os.read(self._r, 512):
+                self.received.extend(data)
+        except BlockingIOError:
+            pass
+
+    def drain(self) -> None:
+        self._drain()
+        self._rearm()
+
+    def _rearm(self) -> None:
+        # CF read callbacks are one-shot. Draining the pipe ourselves can eat
+        # the byte CF already signaled for, and it then never calls on_readable
+        # (the only place that re-enabled it), so presses waited out the timeout.
+        if self._cf is not None:
+            CF, fdref = self._cf[0], self._cf[1]
+            CF.CFFileDescriptorEnableCallBacks(fdref, CF.kCFFileDescriptorReadCallBack)
+
+    def wait(self, timeout: float) -> None:
+        if self._cf is not None:
+            self._rearm()
+            CF = self._cf[0]
+            CF.CFRunLoopRunInMode(CF.kCFRunLoopDefaultMode, timeout, True)
+        else:
+            select.select([self._r], [], [], timeout)
+            self._drain()
 
 
 def acquire_daemon_lock(lock_file: str) -> Optional[int]:
@@ -1788,6 +1896,17 @@ def main():
     state_file = os.path.join(RUNTIME_DIR, "whisper-hotkey-state")
     daemon_lock_file = os.path.join(RUNTIME_DIR, "whisper-hotkey-daemon.lock")
 
+    # Install handlers before the lock publishes our PID: the hotkey wrapper
+    # signals that PID directly, and an unhandled SIGUSR1/2 terminates us.
+    # SIGUSR2 = start, SIGUSR1 = stop. Their handlers do nothing: installing
+    # one is what makes Python write the signal to SignalWaker's pipe, which
+    # the main loop reads in arrival order.
+    shutdown_event = threading.Event()
+    signal.signal(signal.SIGUSR2, lambda *_: None)
+    signal.signal(signal.SIGUSR1, lambda *_: None)
+    signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
+    signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
+
     # Try to acquire the daemon lock
     lock_fd = acquire_daemon_lock(daemon_lock_file)
 
@@ -1834,10 +1953,10 @@ def main():
     logger.info(f"Acquired daemon lock, PID written to {daemon_lock_file}")
 
     # Launch status overlay — GTK on Linux, native AppKit on macOS.
-    # macOS: use venv python so the overlay picks up pyobjc.
-    # Linux: use system python3 so the overlay picks up system gi (GTK3).
-    overlay_script = None
+    # macOS needs the venv's pyobjc; Linux needs the system python3, since
+    # GTK bindings (python3-gi) are a distro package the venv can't see.
     overlay_python = sys.executable if IS_MACOS else (shutil.which("python3") or sys.executable)
+    overlay_script = None
     if ENABLE_OVERLAY:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         candidate = os.path.join(
@@ -1862,96 +1981,60 @@ def main():
             logger.warning(f"Failed to start status overlay: {e}")
             return None
 
-    overlay_proc = spawn_overlay()
-
-    # Signal handlers - use threading.Event for thread-safe signaling
-    # NOTE: Signal handlers should only set flags, not call complex functions like logging
-    start_recording_event = threading.Event()
-    stop_recording_event = threading.Event()
-    shutdown_event = threading.Event()
-
-    def handle_start(signum, frame):
-        # UNSAFE to log here - just set the flag
-        start_recording_event.set()
-
-    def handle_stop(signum, frame):
-        # UNSAFE to log here - just set the flag
-        stop_recording_event.set()
-
-    def handle_shutdown(signum, frame):
-        # UNSAFE to log here - just set the flag
-        shutdown_event.set()
-
-    signal.signal(signal.SIGUSR2, handle_start)  # Start recording
-    signal.signal(signal.SIGUSR1, handle_stop)   # Stop recording
-    signal.signal(signal.SIGTERM, handle_shutdown)  # Shutdown daemon
-    signal.signal(signal.SIGINT, handle_shutdown)   # Ctrl+C
-    logger.info("Signal handlers registered")
-
-    # Start persistent daemon (slow: loads model)
-    # Create state file immediately so extra presses during load send STOP (not START)
-    Path(state_file).touch()
-
-    # Play calming sound while model loads — loop until model is ready
-    # (`afplay` has no loop flag and the chime is only ~4s, shorter than the
-    # model load; a background thread restarts it until we signal stop).
-    loading_sound_stop = threading.Event()
-    loading_sound_thread = None
-    if SOUND_LOADING and os.path.exists(SOUND_LOADING):
-        player = 'afplay' if IS_MACOS else 'paplay'
-
-        def _loop_chime():
-            while not loading_sound_stop.is_set():
-                try:
-                    subprocess.run(
-                        [player, SOUND_LOADING],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=30,
-                    )
-                except (FileNotFoundError, subprocess.TimeoutExpired):
-                    return
-
-        loading_sound_thread = threading.Thread(target=_loop_chime, daemon=True, name="loading-chime")
-        loading_sound_thread.start()
-
-    send_notification(f"Loading {ENGINE} model…")
-    logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
-    daemon = TranscriptionDaemon()
-    daemon.last_activity_time = time.time()
-
-    # Stop loading sound loop and kill any in-flight player
-    loading_sound_stop.set()
-    subprocess.run(['pkill', '-x', 'afplay' if IS_MACOS else 'paplay'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-
-    # Clear any signals the user sent while the model was loading (impatient extra presses)
-    start_recording_event.clear()
-    stop_recording_event.clear()
-    # Re-create state file in case a press during loading deleted it
-    Path(state_file).touch()
-
-    # Auto-start recording on first launch (the user pressed the hotkey to get here)
-    logger.info("Daemon ready, auto-starting first recording...")
-    daemon.start_recording()
-    daemon.last_activity_time = time.time()
-
+    waker = SignalWaker()
+    overlay_proc = None
+    overlay_started = 0.0
+    overlay_crashes = 0  # consecutive exits within 5s of launch
+    daemon = None
+    # Everything after the lock sits inside try/finally so a model-load
+    # failure still kills the overlay and releases the lock and state file.
     try:
+        overlay_proc, overlay_started = spawn_overlay(), time.monotonic()
+
+        # Create state file immediately so extra presses during load send STOP (not START)
+        Path(state_file).touch()
+
+        # apple-streaming has no model to load, so its chime would be a ~50ms blip.
+        stop_chime = start_looping_sound(SOUND_LOADING) if ENGINE != "apple-streaming" else (lambda: None)
+        send_notification(f"Loading {ENGINE} model…")
+        logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
+        try:
+            daemon = TranscriptionDaemon()
+        finally:
+            stop_chime()
+
+        # Drop presses made while the model was loading (impatient extra presses)
+        waker.drain()
+        waker.received.clear()
+        # Re-create state file in case a press during loading deleted it
+        Path(state_file).touch()
+
+        def start_recording():
+            # A failed start must clear the state file, or the next press
+            # would send STOP to an idle daemon instead of retrying.
+            if not daemon.start_recording() and not daemon.recorder.is_recording:
+                try:
+                    os.unlink(state_file)
+                except OSError:
+                    pass
+            daemon.last_activity_time = time.time()
+
+        # Auto-start recording on first launch (the user pressed the hotkey to get here)
+        logger.info("Daemon ready, auto-starting first recording...")
+        start_recording()
+
         logger.info("Daemon loop started, model loaded and ready")
 
         while not shutdown_event.is_set():
-            # Check for start recording signal
-            if start_recording_event.is_set():
-                start_recording_event.clear()
-                logger.info("Received start recording signal")
-                daemon.start_recording()
-                daemon.last_activity_time = time.time()
-
-            # Check for stop recording signal
-            if stop_recording_event.is_set():
-                stop_recording_event.clear()
-                logger.info("Received stop recording signal")
-                daemon.stop_and_process()
+            waker.drain()
+            while waker.received and not shutdown_event.is_set():
+                sig = waker.received.popleft()
+                if sig == signal.SIGUSR2:
+                    logger.info("Received start recording signal")
+                    start_recording()
+                elif sig == signal.SIGUSR1:
+                    logger.info("Received stop recording signal")
+                    daemon.stop_and_process()
 
             # Check for max recording duration
             if (MAX_RECORDING_SECONDS > 0
@@ -1966,45 +2049,38 @@ def main():
                     pass
                 daemon.stop_and_process()
 
-            # Keep the overlay alive: respawn if the user/test killed it.
-            # Cooldown prevents crash-loop spam if the overlay can't start.
-            if overlay_script and (overlay_proc is None or overlay_proc.poll() is not None):
-                now = time.time()
-                if now - getattr(spawn_overlay, '_last_attempt', 0) >= 5.0:
-                    if overlay_proc is not None:
-                        logger.warning(f"Status overlay exited (code {overlay_proc.returncode}); respawning")
-                    spawn_overlay._last_attempt = now
-                    overlay_proc = spawn_overlay()
+            # Keep the overlay alive if the user/test killed it, but don't
+            # respawn one that crashes on launch every 0.5s forever.
+            if overlay_proc is not None and overlay_proc.poll() is not None:
+                overlay_crashes = overlay_crashes + 1 if time.monotonic() - overlay_started < 5 else 0
+                logger.warning(f"Status overlay exited (code {overlay_proc.returncode})")
+                overlay_proc = None
+                if overlay_crashes < 3:
+                    overlay_proc, overlay_started = spawn_overlay(), time.monotonic()
+                else:
+                    logger.error("Status overlay keeps crashing on launch; not respawning")
 
             # Check for idle timeout
-            if daemon.is_idle_timeout_exceeded():
+            if not daemon.recorder.is_recording and daemon.is_idle_timeout_exceeded():
                 logger.info(f"Idle timeout exceeded ({daemon.idle_timeout}s), shutting down daemon")
                 break
 
-            # Wait for signals or timeout (efficient polling).
-            # On macOS, pump the NSRunLoop so SFSpeechRecognizer callbacks
-            # fire during streaming. 5ms keeps signal response near-instant
-            # for the non-streaming engines too.
-            if IS_MACOS:
-                try:
-                    from Foundation import NSRunLoop, NSDate
-                    NSRunLoop.currentRunLoop().runUntilDate_(
-                        NSDate.dateWithTimeIntervalSinceNow_(0.005))
-                except ImportError:
-                    shutdown_event.wait(timeout=0.005)
-            else:
-                shutdown_event.wait(timeout=0.005)
+            # Returns early on any signal; the timeout only paces the
+            # max-duration, overlay and idle checks above.
+            waker.wait(0.5)
 
         logger.info("Daemon loop exiting")
 
     except Exception as e:
         logger.error(f"Unexpected error in main: {e}", exc_info=True)
+        send_notification(f"❌ Daemon crashed: {str(e)[:60]}")
     finally:
         logger.info("Cleaning up...")
         if overlay_proc and overlay_proc.poll() is None:
             overlay_proc.terminate()
             logger.info("Terminated status overlay")
-        daemon.cleanup()
+        if daemon is not None:
+            daemon.cleanup()
         cleanup_status()
         try:
             if os.path.exists(state_file):
@@ -2012,20 +2088,19 @@ def main():
                 logger.info("Removed state file")
         except OSError:
             pass
-        # Release the lock by closing the file descriptor
+        # Unlink while still holding the lock: unlinking after close lets a
+        # starting daemon lock the old inode and then lose its lock file.
+        try:
+            os.unlink(daemon_lock_file)
+            logger.info("Removed daemon lock file")
+        except OSError:
+            pass
         if lock_fd is not None:
             try:
                 os.close(lock_fd)
                 logger.info("Released daemon lock")
             except OSError:
                 pass
-        # Remove lock file
-        try:
-            if os.path.exists(daemon_lock_file):
-                os.unlink(daemon_lock_file)
-                logger.info("Removed daemon lock file")
-        except OSError:
-            pass
         logger.info("=== Daemon exiting ===")
 
 
