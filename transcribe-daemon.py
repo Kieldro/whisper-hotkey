@@ -1023,13 +1023,29 @@ class AudioRecorderDaemon:
 
         # --- 1. Detect utterance restart (Apple silently began a new
         #        utterance; previous partial must be promoted).
+        #
+        # Refinement guard: head_changed/shrank_a_lot also fire when
+        # Apple keeps refining the SAME utterance (e.g.
+        # "More smoke smoke test" → "Writing more smoke test"). Distinguish
+        # by word-set overlap — refinements share most words, true
+        # restarts share few. Without this guard each refinement gets
+        # promoted and the final transcript repeats the same idea N times.
         if prev and not is_final:
             shrank_a_lot = len(text) < max(3, len(prev) // 2)
             head_changed = len(prev) > 15 and text[:10].lower() != prev[:10].lower()
             if shrank_a_lot or head_changed:
-                logger.info(f"[sfs] utterance restart; promoting partial to segment: {prev!r}")
-                self._sfs_segments.append(prev)
-                prev = ""
+                prev_words = set(_sfs_norm_words(prev))
+                new_words_set = set(_sfs_norm_words(text))
+                smaller = min(len(prev_words), len(new_words_set))
+                overlap = len(prev_words & new_words_set) / smaller if smaller else 0.0
+                is_refinement = smaller >= 2 and overlap >= 0.5
+                if is_refinement:
+                    logger.info(f"[sfs] refinement (overlap={overlap:.2f}); dropping prev partial: {prev!r} → {text!r}")
+                    prev = ""
+                else:
+                    logger.info(f"[sfs] utterance restart; promoting partial to segment: {prev!r}")
+                    self._sfs_segments.append(prev)
+                    prev = ""
 
         # --- 2. Detect subsumption (new text contains leading segments)
         new_words = _sfs_norm_words(text)
