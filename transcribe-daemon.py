@@ -183,6 +183,40 @@ def play_sound(sound_file: str) -> None:
         pass
 
 
+def start_looping_sound(sound_file: str):
+    """Replay sound_file until the returned stop() is called.
+
+    Stops only our own player: a blanket `pkill afplay` also cut off any
+    other audio the user had playing through afplay (e.g. TTS readouts).
+    """
+    if not sound_file or not os.path.exists(sound_file):
+        return lambda: None
+    player = 'afplay' if IS_MACOS else 'paplay'
+    stopped = threading.Event()
+    current: list = [None]
+
+    def loop():
+        while not stopped.is_set():
+            try:
+                proc = subprocess.Popen([player, sound_file],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except FileNotFoundError:
+                return
+            current[0] = proc
+            if stopped.is_set():  # stop() ran between the check and Popen
+                proc.terminate()
+            proc.wait()
+
+    threading.Thread(target=loop, daemon=True, name="looping-sound").start()
+
+    def stop():
+        stopped.set()
+        if current[0] is not None:
+            current[0].terminate()
+
+    return stop
+
+
 # ---------------------------------------------------------------------------
 # Feature 7: Waybar/Polybar status integration
 # ---------------------------------------------------------------------------
@@ -1745,38 +1779,15 @@ def main():
     # Create state file immediately so extra presses during load send STOP (not START)
     Path(state_file).touch()
 
-    # Play calming sound while model loads — loop until model is ready
-    # (`afplay` has no loop flag and the chime is only ~4s, shorter than the
-    # model load; a background thread restarts it until we signal stop).
-    loading_sound_stop = threading.Event()
-    loading_sound_thread = None
-    if SOUND_LOADING and os.path.exists(SOUND_LOADING):
-        player = 'afplay' if IS_MACOS else 'paplay'
-
-        def _loop_chime():
-            while not loading_sound_stop.is_set():
-                try:
-                    subprocess.run(
-                        [player, SOUND_LOADING],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=30,
-                    )
-                except (FileNotFoundError, subprocess.TimeoutExpired):
-                    return
-
-        loading_sound_thread = threading.Thread(target=_loop_chime, daemon=True, name="loading-chime")
-        loading_sound_thread.start()
+    # apple-streaming has no model to load, so its chime would be a ~50ms blip.
+    stop_chime = start_looping_sound(SOUND_LOADING) if ENGINE != "apple-streaming" else (lambda: None)
 
     send_notification(f"Loading {ENGINE} model…")
     logger.info(f"Loading {ENGINE} model... (this may take a few seconds on first start)")
     daemon = TranscriptionDaemon()
     daemon.last_activity_time = time.time()
 
-    # Stop loading sound loop and kill any in-flight player
-    loading_sound_stop.set()
-    subprocess.run(['pkill', '-x', 'afplay' if IS_MACOS else 'paplay'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    stop_chime()
 
     # Clear any signals the user sent while the model was loading (impatient extra presses)
     start_recording_event.clear()
