@@ -260,6 +260,16 @@ def cleanup_status() -> None:
         logger.debug(f"Failed to remove status file: {e}")
 
 
+def _load_x11():
+    x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+    # Untyped, ctypes truncates the 64-bit Display* to a C int.
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    return x11
+
+
 def is_shift_held() -> bool:
     """Check if Shift is currently held.
 
@@ -276,7 +286,7 @@ def is_shift_held() -> bool:
             return False
     else:
         try:
-            x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+            x11 = _load_x11()
             display = x11.XOpenDisplay(None)
             if not display:
                 return False
