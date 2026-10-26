@@ -15,7 +15,9 @@ import subprocess
 import ctypes
 import threading
 import signal
+import select
 import logging
+import collections
 import fcntl
 import shutil
 from pathlib import Path
@@ -1619,6 +1621,51 @@ class TranscriptionDaemon:
         self.recorder.cleanup()
 
 
+class SignalWaker:
+    """Sleeps the main loop until a signal arrives or the timeout passes.
+
+    signal.set_wakeup_fd makes the C-level handler write to a pipe; on macOS
+    that pipe is a CFRunLoop source, so waiting also delivers SFSpeech callbacks.
+    """
+
+    def __init__(self):
+        self._r, w = os.pipe()
+        os.set_blocking(self._r, False)
+        os.set_blocking(w, False)
+        signal.set_wakeup_fd(w)
+        self._cf = None
+        if IS_MACOS:
+            try:
+                import CoreFoundation as CF
+            except ImportError:
+                return
+
+            def on_readable(fdref, _types, _info):
+                self._drain()
+                CF.CFFileDescriptorEnableCallBacks(fdref, CF.kCFFileDescriptorReadCallBack)
+
+            fdref = CF.CFFileDescriptorCreate(None, self._r, False, on_readable, None)
+            CF.CFFileDescriptorEnableCallBacks(fdref, CF.kCFFileDescriptorReadCallBack)
+            src = CF.CFFileDescriptorCreateRunLoopSource(None, fdref, 0)
+            CF.CFRunLoopAddSource(CF.CFRunLoopGetCurrent(), src, CF.kCFRunLoopDefaultMode)
+            self._cf = (CF, fdref, src, on_readable)  # CF holds no Python refs
+
+    def _drain(self) -> None:
+        try:
+            while os.read(self._r, 512):
+                pass
+        except BlockingIOError:
+            pass
+
+    def wait(self, timeout: float) -> None:
+        if self._cf is not None:
+            CF = self._cf[0]
+            CF.CFRunLoopRunInMode(CF.kCFRunLoopDefaultMode, timeout, True)
+        else:
+            select.select([self._r], [], [], timeout)
+            self._drain()
+
+
 def acquire_daemon_lock(lock_file: str) -> Optional[int]:
     """
     Try to acquire exclusive lock on daemon file.
@@ -1678,12 +1725,12 @@ def main():
 
     # Install handlers before the lock publishes our PID: the hotkey wrapper
     # signals that PID directly, and an unhandled SIGUSR1/2 terminates us.
-    # Handlers only set flags; logging from a signal handler is unsafe.
-    start_recording_event = threading.Event()
-    stop_recording_event = threading.Event()
+    # Handlers only record the signal; logging from a signal handler is unsafe.
+    # Toggles queue in arrival order (SIGUSR2 = start, SIGUSR1 = stop).
+    toggles = collections.deque()
     shutdown_event = threading.Event()
-    signal.signal(signal.SIGUSR2, lambda *_: start_recording_event.set())
-    signal.signal(signal.SIGUSR1, lambda *_: stop_recording_event.set())
+    signal.signal(signal.SIGUSR2, lambda signum, _: toggles.append(signum))
+    signal.signal(signal.SIGUSR1, lambda signum, _: toggles.append(signum))
     signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
     signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
 
@@ -1760,6 +1807,7 @@ def main():
             logger.warning(f"Failed to start status overlay: {e}")
             return None
 
+    waker = SignalWaker()
     overlay_proc = None
     daemon = None
     # Everything after the lock sits inside try/finally so a model-load
@@ -1779,9 +1827,8 @@ def main():
         finally:
             stop_chime()
 
-        # Clear any signals the user sent while the model was loading (impatient extra presses)
-        start_recording_event.clear()
-        stop_recording_event.clear()
+        # Drop presses made while the model was loading (impatient extra presses)
+        toggles.clear()
         # Re-create state file in case a press during loading deleted it
         Path(state_file).touch()
 
@@ -1793,18 +1840,14 @@ def main():
         logger.info("Daemon loop started, model loaded and ready")
 
         while not shutdown_event.is_set():
-            # Check for start recording signal
-            if start_recording_event.is_set():
-                start_recording_event.clear()
-                logger.info("Received start recording signal")
-                daemon.start_recording()
-                daemon.last_activity_time = time.time()
-
-            # Check for stop recording signal
-            if stop_recording_event.is_set():
-                stop_recording_event.clear()
-                logger.info("Received stop recording signal")
-                daemon.stop_and_process()
+            while toggles and not shutdown_event.is_set():
+                if toggles.popleft() == signal.SIGUSR2:
+                    logger.info("Received start recording signal")
+                    daemon.start_recording()
+                    daemon.last_activity_time = time.time()
+                else:
+                    logger.info("Received stop recording signal")
+                    daemon.stop_and_process()
 
             # Check for max recording duration
             if (MAX_RECORDING_SECONDS > 0
@@ -1830,19 +1873,9 @@ def main():
                 logger.info(f"Idle timeout exceeded ({daemon.idle_timeout}s), shutting down daemon")
                 break
 
-            # Wait for signals or timeout (efficient polling).
-            # On macOS, pump the NSRunLoop so SFSpeechRecognizer callbacks
-            # fire during streaming. 5ms keeps signal response near-instant
-            # for the non-streaming engines too.
-            if IS_MACOS:
-                try:
-                    from Foundation import NSRunLoop, NSDate
-                    NSRunLoop.currentRunLoop().runUntilDate_(
-                        NSDate.dateWithTimeIntervalSinceNow_(0.005))
-                except ImportError:
-                    shutdown_event.wait(timeout=0.005)
-            else:
-                shutdown_event.wait(timeout=0.005)
+            # Returns early on any signal; the timeout only paces the
+            # max-duration, overlay and idle checks above.
+            waker.wait(0.5)
 
         logger.info("Daemon loop exiting")
 
