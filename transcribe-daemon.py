@@ -154,24 +154,28 @@ def validate_config() -> None:
     logger.info("Config validation passed")
 
 def send_notification(message: str) -> None:
-    """Send desktop notification that replaces previous ones."""
+    """Send desktop notification that replaces previous ones, without
+    blocking the caller on the notifier process."""
     if not ENABLE_NOTIFICATIONS:
         return
+    if IS_MACOS:
+        # Text goes in as an argument: interpolating it into the script broke
+        # on any quote in the transcript and let dictated text run AppleScript.
+        cmd = ['osascript',
+               '-e', 'on run argv',
+               '-e', 'display notification (item 1 of argv) with title "Voice Transcription"',
+               '-e', 'end run',
+               message]
+    else:
+        cmd = ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message]
     try:
-        if IS_MACOS:
-            subprocess.run(
-                ['osascript', '-e', f'display notification "{message}" with title "Voice Transcription"'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        else:
-            subprocess.run(
-                ['notify-send', '-t', '1500', '-r', str(NOTIFICATION_ID), 'Voice Transcription', message],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except FileNotFoundError:
         pass  # notify tool not installed
+
+
+def _preview(text: str, limit: int = 50) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def play_sound(sound_file: str) -> None:
@@ -1508,7 +1512,7 @@ class TranscriptionPipeline:
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             play_sound(SOUND_PASTE)
-            send_notification(f"Pasted: {final_text[:50]}...")
+            send_notification(f"Pasted: {_preview(final_text)}")
 
             # Restore clipboard (only for direct-type methods that don't need clipboard)
             if saved_clipboard is not None and method_used in ("xdotool-type", "wtype"):
@@ -1517,7 +1521,7 @@ class TranscriptionPipeline:
         else:
             logger.info("Auto-paste disabled")
             play_sound(SOUND_PASTE)
-            send_notification(f"Copied: {final_text[:50]}...")
+            send_notification(f"Copied: {_preview(final_text)}")
 
         logger.info("Processing complete")
         update_status("idle", last_text=final_text[:100])
