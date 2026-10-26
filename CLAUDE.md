@@ -15,6 +15,7 @@ Push-to-talk voice transcription daemon for macOS and Linux. Hotkey toggles reco
 - **State file toggle**: `whisper-hotkey-state` in runtime dir (`$XDG_RUNTIME_DIR` on Linux, `$TMPDIR` on macOS) exists = recording. Hotkey wrapper creates/removes it; the daemon removes it when a start fails or max duration auto-stops.
 - **Auto-start on first press**: Daemon creates state file before model load, plays wind chime during load, auto-starts recording when ready. Clears queued signals after load to avoid race conditions.
 - **Lazy daemon**: Starts on first hotkey press, optionally unloads after IDLE_TIMEOUT. Not a systemd service by default.
+- **Auto-update**: the daemon runs `scripts/update.sh` at start and every `AUTO_UPDATE_INTERVAL` (throttled across restarts by a stamp file). It only fast-forwards a clean checkout, import-checks the new daemon (rolls back on failure), then SIGHUPs the daemon, which exits once idle. It exits rather than re-execs so the next press cold-starts through skhd. A dirty working tree blocks updates, so local development is never overwritten.
 - **Main loop sleeps on signals**: `signal.set_wakeup_fd` + a CFRunLoop source (macOS) / `select` (Linux). On macOS the main CFRunLoop must keep running, or SFSpeech callbacks never fire.
 - **Instant paste**: Uses CGEvent Cmd+V (macOS, clipboard written via NSPasteboard), `xdotool type --delay 0` (X11), or `ydotool key Ctrl+V` (Wayland).
 - **Shift-to-submit**: Detects Shift at paste time via Quartz/CGEvent (macOS) or X11 XQueryKeymap (Linux X11); presses Enter after paste. Wayland not supported.
@@ -34,6 +35,7 @@ All config in `.env` (loaded via python-dotenv). See `.env.example` for all opti
 
 - Importing the daemon module writes its log and status files to `$TMPDIR`; point `TMPDIR` at a temp dir first or a test pops the live overlay.
 - `venv/bin/python test_sfs_handle.py` — streaming handler logic with fake results.
+- `bash test_update.sh` — updater against throwaway git repos; `venv/bin/python test_auto_update.py` — daemon restart-when-idle on SIGHUP.
 - `venv/bin/python test_sfs_live.py` — real SFSpeechRecognizer fed from `say` audio (no mic/paste); needs Speech Recognition granted to the terminal.
 - Kill daemon: `pkill -f transcribe-daemon` (the next hotkey press cold-starts it)
 - Check logs: `tail -f "${XDG_RUNTIME_DIR:-$TMPDIR}/whisper-hotkey.log"`

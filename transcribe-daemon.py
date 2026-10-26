@@ -98,6 +98,8 @@ PASTE_METHOD = os.getenv("PASTE_METHOD", "auto")
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "true").lower() == "true"
 RESTORE_CLIPBOARD = os.getenv("RESTORE_CLIPBOARD", "false").lower() == "true"
 ENABLE_OVERLAY = os.getenv("ENABLE_OVERLAY", "true").lower() == "true"
+AUTO_UPDATE = os.getenv("AUTO_UPDATE", "true").lower() == "true"
+AUTO_UPDATE_INTERVAL = _env_number("AUTO_UPDATE_INTERVAL", 3600, int)
 
 # Sound file paths (optional - will skip if not found)
 if IS_MACOS:
@@ -1701,6 +1703,17 @@ def read_daemon_pid(lock_file: str) -> Optional[int]:
         return None
 
 
+def spawn_updater() -> None:
+    """Run scripts/update.sh in the background; it SIGHUPs us if it pulled an update."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "update.sh")
+    try:
+        with open(LOG_FILE, "a") as log:
+            subprocess.Popen(["bash", script, str(os.getpid())], stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True)
+    except OSError as e:
+        logger.warning(f"Auto-update check failed to start: {e}")
+
+
 def main():
     """Run daemon in toggle mode (for hotkey integration)."""
     logger.info("=== Daemon started ===")
@@ -1736,6 +1749,7 @@ def main():
     shutdown_event = threading.Event()
     signal.signal(signal.SIGUSR2, lambda *_: None)
     signal.signal(signal.SIGUSR1, lambda *_: None)
+    signal.signal(signal.SIGHUP, lambda *_: None)  # update.sh pulled new code
     signal.signal(signal.SIGTERM, lambda *_: shutdown_event.set())
     signal.signal(signal.SIGINT, lambda *_: shutdown_event.set())
 
@@ -1856,6 +1870,8 @@ def main():
         start_recording()
 
         logger.info("Daemon loop started, model loaded and ready")
+        next_update_check = 0.0
+        update_pending = False
 
         while not shutdown_event.is_set():
             waker.drain()
@@ -1867,6 +1883,19 @@ def main():
                 elif sig == signal.SIGUSR1:
                     logger.info("Received stop recording signal")
                     daemon.stop_and_process()
+                elif sig == signal.SIGHUP:
+                    update_pending = True
+
+            if AUTO_UPDATE and time.monotonic() >= next_update_check:
+                next_update_check = time.monotonic() + max(AUTO_UPDATE_INTERVAL, 60)
+                spawn_updater()
+
+            # Exit rather than re-exec: the next press cold-starts the new code
+            # through skhd, which holds the Mic/Speech/Accessibility grants.
+            if update_pending and not daemon.recorder.is_recording:
+                logger.info("Update installed; exiting so the next press runs it")
+                send_notification("Updated. The next press starts the new version")
+                break
 
             # Check for max recording duration
             if (MAX_RECORDING_SECONDS > 0

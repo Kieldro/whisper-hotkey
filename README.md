@@ -146,6 +146,8 @@ Copy `.env.example` to `.env` and edit as needed:
 | `TRAILING_SPEECH_DELAY` | `0.5` | Seconds to keep recording after the stop press (apple-streaming caps it at 0.3) |
 | `VOCABULARY_HINTS` | `Claude,Anthropic` | Comma-separated words to bias recognition toward (apple-streaming and whisper; Parakeet has no hint support, use `replacements.json`) |
 | `VOCABULARY_FILE` | `vocabulary.txt` | Extra hints, one per line (`#` comments), merged with `VOCABULARY_HINTS`. Git-ignored |
+| `AUTO_UPDATE` | `true` | Fast-forward the checkout to its upstream branch while the daemon runs, then restart on the new version once idle. Skipped if the checkout has local changes or unpushed commits; an update that fails to import is rolled back. Run by hand: `scripts/update.sh` |
+| `AUTO_UPDATE_INTERVAL` | `3600` | Seconds between update checks (minimum 60) |
 
 ## Architecture
 
