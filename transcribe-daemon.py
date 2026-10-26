@@ -342,23 +342,19 @@ logger.info(f"Using clipboard/typing mode: {SESSION_TYPE}")
 # ---------------------------------------------------------------------------
 
 _vad_model = None
-_vad_utils = None
 
 
 def _get_vad_model():
-    """Lazy-load Silero VAD model once, reuse on subsequent calls."""
-    global _vad_model, _vad_utils
+    """Lazy-load Silero VAD model once, reuse on subsequent calls.
+
+    From the pinned silero-vad package, which bundles the weights; torch.hub
+    fetched and executed the repo's GitHub master instead."""
+    global _vad_model
     if _vad_model is None:
-        import torch
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-        )
-        _vad_model = model
-        _vad_utils = utils
+        from silero_vad import load_silero_vad
+        _vad_model = load_silero_vad()
         logger.info("Silero VAD model loaded")
-    return _vad_model, _vad_utils
+    return _vad_model
 
 
 def vad_trim_audio(audio_path: str) -> Optional[str]:
@@ -369,13 +365,13 @@ def vad_trim_audio(audio_path: str) -> Optional[str]:
     try:
         import torch
         import numpy as np
+        from silero_vad import get_speech_timestamps
     except ImportError:
-        logger.warning("torch not installed, skipping VAD")
+        logger.warning("silero-vad/torch not installed, skipping VAD")
         return audio_path
 
     try:
-        model, utils = _get_vad_model()
-        get_speech_timestamps = utils[0]
+        model = _get_vad_model()
 
         with wave.open(audio_path, "rb") as wf:
             n_channels = wf.getnchannels()
