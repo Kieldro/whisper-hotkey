@@ -25,6 +25,7 @@ Push-to-talk voice transcription daemon for macOS and Linux. Hotkey toggles reco
 
 - **apple-streaming** (macOS): SFSpeechRecognizer on-device, live transcript in the overlay. Apple finalizes a task on ~1-2s silence, so the daemon chains tasks and dedupes Apple's re-transcriptions (`_sfs_handle`).
 - **Parakeet TDT** (default): `nemo-parakeet-tdt-0.6b-v3` via onnx-asr. ~0.3s transcription. 25 languages.
+  On CUDA it loads 8-bit MatMul weights (`PARAKEET_WEIGHTS=q8`, built once by `scripts/quantize-parakeet.py` into `~/.cache/whisper-hotkey`) with a shrinking `kSameAsRequested` arena: ~1.2 GB VRAM instead of ~3.5 GB, which starved Chrome of GPU buffers (black canvases). fp16 is not used: ~6x slower MatMul on GTX 16xx (no tensor cores). TensorRT is left out of the provider list (its failed init drops the CUDA options).
 - **faster-whisper**: CTranslate2-based. Configurable model sizes. ~0.5s on GPU. Multilingual. No Apple GPU backend (`DEVICE=mps` fails and falls back to CPU).
 
 ## Config

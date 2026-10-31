@@ -48,6 +48,7 @@ ENGINE = os.getenv("ENGINE", "parakeet")  # whisper or parakeet
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 DEVICE = os.getenv("DEVICE", "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")
+PARAKEET_WEIGHTS = os.getenv("PARAKEET_WEIGHTS", "q8").lower()  # q8 or fp32 (CUDA only)
 ENABLE_POLISHING = os.getenv("ENABLE_POLISHING", "false").lower() == "true"
 AUTO_PASTE = os.getenv("AUTO_PASTE", "true").lower() == "true"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -170,6 +171,9 @@ def validate_config() -> None:
 
         if COMPUTE_TYPE not in VALID_COMPUTE_TYPES:
             errors.append(f"COMPUTE_TYPE='{COMPUTE_TYPE}' invalid. Valid: {sorted(VALID_COMPUTE_TYPES)}")
+
+    if ENGINE == "parakeet" and PARAKEET_WEIGHTS not in ("q8", "fp32"):
+        errors.append(f"PARAKEET_WEIGHTS='{PARAKEET_WEIGHTS}' invalid. Valid: ['fp32', 'q8']")
 
     if IDLE_TIMEOUT < 0:
         errors.append(f"IDLE_TIMEOUT={IDLE_TIMEOUT} must be >= 0")
@@ -1483,6 +1487,66 @@ class AudioRecorderDaemon:
             self.process.terminate()
 
 
+PARAKEET_MODEL = "nemo-parakeet-tdt-0.6b-v3"
+
+
+def _parakeet_q8_dir() -> Optional[Path]:
+    """Return the 8-bit-weight encoder dir, building it on first use (~10 s once the fp32 model is cached)."""
+    cache = Path(os.getenv("XDG_CACHE_HOME") or Path.home() / ".cache")
+    out = cache / "whisper-hotkey" / "parakeet-tdt-0.6b-v3-q8"
+    if (out / "encoder-model.q8.onnx").exists():
+        return out
+    script = Path(__file__).resolve().parent / "scripts" / "quantize-parakeet.py"
+    logger.info(f"Building 8-bit Parakeet weights in {out} (one-time)...")
+    try:
+        r = subprocess.run([sys.executable, str(script), str(out)],
+                           capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"8-bit weight build failed: {e}")
+        return None
+    if r.returncode != 0:
+        logger.warning(f"8-bit weight build failed (exit {r.returncode}): {r.stderr.strip()[-800:]}")
+        return None
+    return out
+
+
+def _load_parakeet_cuda(onnx_asr, rt):
+    """Load Parakeet on CUDA with the smallest VRAM footprint that keeps speed.
+
+    The fp32 model held ~3.5 GB of a 6 GB card, enough to starve Chrome of GPU
+    buffers (black canvases). Measured on a GTX 1660 Super: 8-bit weights plus
+    exact-size arena growth and post-run arena shrinkage sit at ~1.2 GB
+    steady and ~1.6 GB peak on short clips, with identical transcripts.
+    """
+    providers = [("CUDAExecutionProvider", {"arena_extend_strategy": "kSameAsRequested"}),
+                 "CPUExecutionProvider"]
+    logger.info(f"onnxruntime providers: {providers}, weights={PARAKEET_WEIGHTS}")
+    model = None
+    if PARAKEET_WEIGHTS == "q8":
+        q8_dir = _parakeet_q8_dir()
+        if q8_dir is not None:
+            try:
+                model = onnx_asr.load_model(PARAKEET_MODEL, q8_dir, quantization="q8", providers=providers)
+            except Exception as e:
+                logger.warning(f"8-bit weights failed to load ({e}), using fp32")
+    if model is None:
+        model = onnx_asr.load_model(PARAKEET_MODEL, providers=providers)
+
+    # Attention memory grows with clip length (a 120 s dictation adds ~1 GB),
+    # and ORT's arena keeps whatever it grew to. Shrinking the encoder's arena
+    # after each run hands that back to the driver; no measurable latency cost.
+    encoder = getattr(getattr(model, "asr", None), "_encoder", None)
+    if encoder is None:
+        logger.warning("onnx-asr encoder session not found; GPU arena will not shrink after runs")
+    else:
+        shrink = rt.RunOptions()
+        shrink.add_run_config_entry("memory.enable_memory_arena_shrinkage", "gpu:0")
+        run = encoder.run
+        encoder.run = lambda output_names, input_feed, run_options=None: run(
+            output_names, input_feed, run_options or shrink)
+    return model
+
+
 class TranscriptionPipeline:
     """Handles transcription and polishing pipeline."""
 
@@ -1502,12 +1566,18 @@ class TranscriptionPipeline:
             # uses external-data (.onnx.data) and CoreML's initializer loses
             # the path: "model_path must not be empty" (reproduced on
             # onnxruntime 1.24.x and 1.25.0). Exclude CoreML but keep every
-            # other provider — on Linux/NVIDIA this preserves CUDA/TensorRT
-            # acceleration; on macOS it falls back to CPU (~107ms inference
-            # on Apple Silicon, so still plenty fast).
-            providers = [p for p in rt.get_available_providers() if p != "CoreMLExecutionProvider"]
-            logger.info(f"onnxruntime providers: {providers}")
-            self.model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", providers=providers)
+            # other provider; on macOS it falls back to CPU (~107ms inference
+            # on Apple Silicon, so still plenty fast). TensorRT is dropped
+            # too: onnxruntime-gpu lists it without its libs installed, and
+            # its failed init makes ORT fall back to CUDA without our options.
+            available = rt.get_available_providers()
+            if "CUDAExecutionProvider" in available:
+                self.model = _load_parakeet_cuda(onnx_asr, rt)
+            else:
+                providers = [p for p in available
+                             if p not in ("CoreMLExecutionProvider", "TensorrtExecutionProvider")]
+                logger.info(f"onnxruntime providers: {providers}")
+                self.model = onnx_asr.load_model(PARAKEET_MODEL, providers=providers)
             logger.info("Parakeet model loaded successfully")
         else:
             from faster_whisper import WhisperModel

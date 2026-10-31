@@ -173,6 +173,12 @@ echo ""
 echo "Downloading model (this may take a minute)..."
 if [ "$ENGINE" = "parakeet" ]; then
     "$VENV_DIR/bin/python" -c "import onnx_asr; onnx_asr.load_model('nemo-parakeet-tdt-0.6b-v3'); print('Model downloaded')"
+    if [ "$OS_TYPE" != "Darwin" ] && command -v nvidia-smi &>/dev/null; then
+        echo "Building 8-bit Parakeet weights for the GPU..."
+        "$VENV_DIR/bin/pip" install -q onnx onnx-ir
+        "$VENV_DIR/bin/python" "$PROJECT_DIR/scripts/quantize-parakeet.py" "${XDG_CACHE_HOME:-$HOME/.cache}/whisper-hotkey/parakeet-tdt-0.6b-v3-q8" \
+            || echo "8-bit build failed; the daemon will retry on first start (or set PARAKEET_WEIGHTS=fp32)"
+    fi
 elif [ "$ENGINE" = "whisper" ]; then
     "$VENV_DIR/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small'); print('Model downloaded')"
 else

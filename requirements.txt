@@ -3,6 +3,9 @@ ctranslate2>=4.0.0  # Only needed for ENGINE=whisper (pin <=4.4.0 on Ubuntu 24.0
 # For ENGINE=parakeet install these (install.sh does it automatically):
 #   onnx-asr[hub] 'onnxruntime!=1.21'
 # (1.21 has a HF symlink bug.)
+# On Linux/NVIDIA also onnxruntime-gpu plus these, which build the 8-bit
+# Parakeet weights (PARAKEET_WEIGHTS=q8):
+#   onnx onnx-ir
 openai>=1.0.0
 python-dotenv
 numpy>=1.20.0       # Audio normalization and VAD trimming
